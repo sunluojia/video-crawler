@@ -1,15 +1,20 @@
 """身份池的快照和账号池页面的操作，见爬取方案第 6.3 节。"""
 
+import asyncio
 import time
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from video_crawler import identities
 from video_crawler.api import control_api
 from video_crawler.browser import Browsers, Session
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.runner import Runner
-from video_crawler.scheduler import Scheduler
+from video_crawler.scheduler import Lease, Scheduler
 from video_crawler.settings import Settings
 from video_crawler.store import Store
 
@@ -94,6 +99,93 @@ def test_the_pool_tops_up_to_what_the_scheduler_assigns(pool):
     for name in "bcd":
         add(pool, name, fails=3)
     assert pool._next() is None  # 最多保留目标的两倍
+
+
+async def test_warming_can_resize_and_reserves_each_profile_and_target_slot(pool, monkeypatch):
+    monkeypatch.setattr(identities, "CHECK_EVERY", 0.01)
+    stale = add(pool, "stale", warmed=False)
+    started = asyncio.Queue()
+    gates = {}
+
+    async def warm(identity: Identity) -> None:
+        gates[identity.id] = asyncio.Event()
+        started.put_nowait(identity)
+        await gates[identity.id].wait()
+        pool.refreshed(identity, Session({"tt_chain_token": "test"}, "ua", "146"))
+        pool.identities[identity.id] = identity
+
+    monkeypatch.setattr(pool, "_warm", warm)
+    loop = asyncio.create_task(pool.run())
+    try:
+        pool.configure(3, 1)
+        assert (await asyncio.wait_for(started.get(), 1)) is stale
+        assert pool.snapshot()["warming"] == 1
+
+        pool.configure(3, 4)
+        second = await asyncio.wait_for(started.get(), 1)
+        third = await asyncio.wait_for(started.get(), 1)
+        snapshot = pool.snapshot()
+        assert snapshot["warming"] == 3
+        assert {item["id"] for item in snapshot["items"] if item["state"] == "warming"} == {
+            stale.id,
+            second.id,
+            third.id,
+        }
+        assert len({stale.id, second.id, third.id}) == 3
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(started.get(), 0.05)
+
+        pool.configure(4, 1)
+        gates[stale.id].set()
+        gates[second.id].set()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(started.get(), 0.05)
+        assert third.busy and pool.snapshot()["warming"] == 1
+
+        gates[third.id].set()
+        fourth = await asyncio.wait_for(started.get(), 1)
+        assert fourth.id not in {stale.id, second.id, third.id}
+        assert pool.snapshot()["warming"] == 1
+    finally:
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+    assert pool.snapshot()["warming"] == 0
+
+
+async def test_stopping_parallel_warmers_returns_leases_and_removes_unfinished_profiles(
+    pool, monkeypatch
+):
+    leases = [Lease(f"lease-{i}", "203.0.113.1", {"kind": "direct"}) for i in range(2)]
+    monkeypatch.setattr(pool._scheduler, "lease", AsyncMock(side_effect=leases))
+    release = AsyncMock()
+    monkeypatch.setattr(pool._scheduler, "release", release)
+    opened = asyncio.Queue()
+
+    @asynccontextmanager
+    async def open_profile(profile, route, *, warming):
+        profile.mkdir()
+
+        async def goto(*args, **kwargs):
+            opened.put_nowait(profile)
+            await asyncio.Future()
+
+        yield SimpleNamespace(goto=goto)
+
+    monkeypatch.setattr(pool._browsers, "open", open_profile)
+    pool.configure(2, 2)
+    loop = asyncio.create_task(pool.run())
+    try:
+        paths = [await asyncio.wait_for(opened.get(), 1) for _ in leases]
+        assert len(set(paths)) == 2
+        assert all(path.is_dir() for path in paths)
+    finally:
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+    assert {call.args[0].id for call in release.await_args_list} == {lease.id for lease in leases}
+    assert all(not path.exists() for path in paths)
+    assert pool.snapshot()["warming"] == 0
 
 
 def test_refresh_and_retire_from_the_page(pool):

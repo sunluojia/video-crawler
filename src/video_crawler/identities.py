@@ -2,7 +2,7 @@
 
 一个身份就是一个真 Chrome 的资料目录，用它预热出 Cookie 和 tt_chain_token。身份不绑线路，
 每次用都向调度中心要一条采集线路。Cookie 和 token 只放内存，重启后按已有目录重新预热。
-后台一个循环，同时只预热一个：先刷新快过期的，再补到目标数量。
+按设备的预热并发先刷新快过期的，再补到目标数量。
 """
 
 import asyncio
@@ -10,6 +10,7 @@ import logging
 import shutil
 import time
 from collections import Counter, deque
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -80,10 +81,13 @@ class IdentityPool:
         self._store, self._scheduler, self._browsers = store, scheduler, browsers
         self.target = 0
         """要保持的可用身份数，账号池页面设置，调度中心随心跳按设备分摊下发；拿到之前不新建。"""
+        self.warm_slots = 0
+        """预热并发随心跳下发，第一次心跳之前暂不开始。"""
         self.browser: str | None = None
         """本机 Chrome 主版本，第一次预热后得知。"""
         self.identities: dict[str, Identity] = {}
-        self.warming: Identity | None = None
+        self._warming: dict[str, Identity] = {}
+        self._wake = asyncio.Event()
         self._avoid: list[str] = []
         """上次预热失败的线路，下次避开。"""
         self._recent: deque[tuple[float, str, bool]] = deque()
@@ -110,7 +114,7 @@ class IdentityPool:
             "target": self.target,
             "ready": states["ready"] + states["in_use"],
             "in_use": states["in_use"],
-            "warming": int(self.warming is not None),
+            "warming": len(self._warming),
             "cooling": states["cooling"],
             "total": len(self.identities),
         }
@@ -126,8 +130,9 @@ class IdentityPool:
         total = Counter(name for _, name, _ in self._recent)
         failed = Counter(name for _, name, ok in self._recent if not ok)
         shown = list(self.identities.values())
-        if self.warming and self.warming.id not in self.identities:
-            shown.append(self.warming)  # 新建的预热成功前还不在池里
+        shown.extend(
+            identity for key, identity in self._warming.items() if key not in self.identities
+        )
         retired = self._store.retired(now - RETIRED_SINCE, RETIRED_SHOWN)
         shown += [Identity(**record) for record in retired]
         return {
@@ -149,7 +154,7 @@ class IdentityPool:
     def _state(self, identity: Identity, now: float) -> str:
         if identity.retired_at:
             return "retired"
-        if identity is self.warming:
+        if identity.id in self._warming:
             return "warming"
         if identity.busy:
             return "in_use"
@@ -211,11 +216,51 @@ class IdentityPool:
 
     # ---- 后台补充和刷新 ----
 
+    def configure(self, target: int, warm_slots: int) -> None:
+        if (target, warm_slots) != (self.target, self.warm_slots):
+            self.target, self.warm_slots = target, warm_slots
+            self._wake.set()
+
     async def run(self) -> None:
-        while True:
-            if identity := self._next():
-                await self._warm(identity)
-            await asyncio.sleep(CHECK_EVERY)
+        jobs: set[asyncio.Task[None]] = set()
+
+        def finished(job: asyncio.Task[None]) -> None:
+            jobs.discard(job)
+            self._wake.set()
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                while True:
+                    self._wake.clear()
+                    for _ in range(self.warm_slots - len(jobs)):
+                        identity = self._next()
+                        if identity is None:
+                            break
+                        identity.busy = True
+                        self._warming[identity.id] = identity
+                        job = group.create_task(self._attempt(identity))
+                        jobs.add(job)
+                        job.add_done_callback(finished)
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self._wake.wait(), CHECK_EVERY)
+        finally:
+            # 关闭时也释放已预留但还未来得及启动的身份。
+            for identity in self._warming.values():
+                identity.busy = False
+            self._warming.clear()
+
+    async def _attempt(self, identity: Identity) -> None:
+        try:
+            await self._warm(identity)
+        except Exception:
+            log.exception("身份 %s 预热异常", identity.id)
+        finally:
+            identity.busy = False
+            self._warming.pop(identity.id)
+            if identity.id not in self.identities:
+                shutil.rmtree(self.profile(identity), ignore_errors=True)
+        # 每个预热名额做完一次后再等一轮，失败时也按此节奏重试。
+        await asyncio.sleep(CHECK_EVERY)
 
     def _next(self) -> Identity | None:
         """先刷新没有 token 或快过期的，再补到目标数量。"""
@@ -227,20 +272,21 @@ class IdentityPool:
         ]
         if stale:
             return min(stale, key=lambda identity: identity.warmed_at)
-        if self.counted() < self.target and len(self.identities) < self.target * MAX_FACTOR:
+        pending = sum(key not in self.identities for key in self._warming)
+        if (
+            self.counted() + pending < self.target
+            and len(self.identities) + pending < self.target * MAX_FACTOR
+        ):
             return Identity(uuid4().hex[:12])
         return None
 
     async def _warm(self, identity: Identity) -> None:
         """预热：打开首页等页面数据出现，拿到 tt_chain_token 才算成功。新建的成功后才加入身份池。"""
-        identity.busy = True
         try:
             lease = await self._scheduler.lease(CRAWL, avoid=self._avoid)
         except Wait as wait:
-            identity.busy = False
             log.info("预热等线路：%s", wait.reason)
             return
-        self.warming = identity
         session, detail = None, "预热没拿到 tt_chain_token"
         try:
             async with self._browsers.open(
@@ -254,7 +300,6 @@ class IdentityPool:
         except (BrowserError, Retry) as error:
             detail = f"预热失败：{error}"
         finally:
-            identity.busy, self.warming = False, None
             ok = bool(session and session.token)
             self.note("warm", ok)
             await self._scheduler.release(
@@ -262,16 +307,14 @@ class IdentityPool:
             )
         if not ok:
             self._avoid = [lease.line]
-            if identity.id not in self.identities:
-                shutil.rmtree(self.profile(identity), ignore_errors=True)
             log.info("身份 %s %s", identity.id, detail)
             return
         self._avoid = []
         log.info("身份 %s 预热好了", identity.id)
         self.browser = identity.browser = session.browser
         self.refreshed(identity, session)
-        self.identities[identity.id] = identity
         self._store.save_identity(identity.record())
+        self.identities[identity.id] = identity
         for other in list(self.identities.values()):
             if other.browser != self.browser and not other.busy:
                 self.retire(other, f"Chrome 从 {other.browser} 换成了 {self.browser}")

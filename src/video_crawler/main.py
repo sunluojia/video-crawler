@@ -80,16 +80,22 @@ async def serve(settings: Settings) -> None:
         while True:
             try:
                 reply = await scheduler.register(settings.url, VERSION, pool.snapshot())
-                pool.target = reply["identity_target"]
                 slots = {
                     CRAWL_CREATOR: reply["crawl_slots"],
                     DOWNLOAD_VIDEO: reply["download_slots"],
                 }
-                if slots != runner.slots:
-                    log.info("并发：同时获取作品 %s 个，同时下载 %s 个", *slots.values())
+                warm_slots = reply.get("warm_slots") or 1
+                if slots != runner.slots or warm_slots != pool.warm_slots:
+                    log.info(
+                        "并发：同时获取作品 %s 个，同时下载 %s 个，同时预热 %s 个",
+                        slots[CRAWL_CREATOR],
+                        slots[DOWNLOAD_VIDEO],
+                        warm_slots,
+                    )
+                    await browsers.resize(slots[CRAWL_CREATOR] + warm_slots)
                     runner.slots.update(slots)
-                    await browsers.resize(reply["crawl_slots"] + 1)
                     runner.wake()
+                pool.configure(reply["identity_target"] or 0, warm_slots)
             except httpx.HTTPError as error:
                 log.warning("注册失败，稍后重试：%s", error)
             await asyncio.sleep(15)

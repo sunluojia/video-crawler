@@ -35,7 +35,7 @@ class Browsers:
     def __init__(self, channel: str, warm_headless: bool = False) -> None:
         self._channel = channel
         self.limit = 0
-        """同时开的 Chrome 上限，一个约 400 MB：获取作品的并发加 1 个预热，随心跳调整。"""
+        """同时开的 Chrome 上限：采集并发加预热并发，随心跳调整。"""
         self._open = 0
         self._changed = asyncio.Condition()
         self._warm_headless = warm_headless

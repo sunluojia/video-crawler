@@ -1,0 +1,10 @@
+**
+!pyproject.toml
+!uv.lock
+!src
+!src/**
+src/**/__pycache__
+src/**/*.egg-info
+!deployment
+!deployment/Dockerfile
+!deployment/start-crawler.sh

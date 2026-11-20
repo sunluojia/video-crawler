@@ -1,0 +1,45 @@
+[project]
+name = "video-crawler"
+version = "0.1.0"
+description = "TikTok 爬取程序：获取达人资料和最新作品、下载视频，由调度中心派任务"
+requires-python = ">=3.12"
+dependencies = [
+    "curl-cffi>=0.17.0",
+    "dramatiq[redis]>=2.2.1",
+    "fastapi>=0.165.0",
+    "httpx[socks]>=0.28.1",
+    "patchright>=1.64.4",
+    "pydantic-settings>=2.16.3",
+    "uvicorn>=0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9",
+    "pytest-asyncio>=1.2",
+    "ruff>=0.17",
+]
+
+[project.scripts]
+video-crawler = "video_crawler.main:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# 中文注释和提示里的全角标点是正常写法。
+ignore = ["RUF001", "RUF002", "RUF003"]

@@ -3,13 +3,15 @@
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from video_crawler.download import DownloadProgress
 from video_crawler.identities import IdentityPool
 from video_crawler.proxycheck import check_proxy, measure_speed
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
@@ -18,7 +20,13 @@ from video_crawler.store import Store
 
 
 def control_api(
-    token: str, store: Store, runner: Runner, pool: IdentityPool, scheduler: Scheduler
+    token: str,
+    store: Store,
+    runner: Runner,
+    pool: IdentityPool,
+    scheduler: Scheduler,
+    downloads: Callable[[], list[DownloadProgress]] = list,
+    download_speed: Callable[[], int] | None = None,
 ) -> FastAPI:
     def authorized(
         credentials: Annotated[
@@ -84,6 +92,13 @@ def control_api(
                 datetime.fromtimestamp(runner.paused_until, UTC).isoformat() if paused else None
             ),
         }
+
+    @app.get("/api/download-progress")
+    async def download_progress(response: Response) -> list[DownloadProgress]:
+        """当前正在处理的下载，按实际接收的字节数报告。"""
+        if download_speed is not None:
+            response.headers["X-Download-Bytes-Per-Second"] = str(download_speed())
+        return downloads()
 
     @app.post("/api/proxy-tests")
     def proxy_tests(body: dict) -> list[dict]:

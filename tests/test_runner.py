@@ -8,6 +8,7 @@ import pytest
 
 from video_crawler.api import control_api
 from video_crawler.browser import Browsers
+from video_crawler.download import Downloader
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import IdentityPool
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner, event
@@ -162,6 +163,56 @@ async def test_slots_from_the_heartbeat_take_effect_without_restart(store, tmp_p
     for job in jobs:
         job.cancel()
     await asyncio.gather(*jobs, return_exceptions=True)
+
+
+async def test_download_progress_stops_reporting_cancelled_tasks(store, tmp_path, monkeypatch):
+    monkeypatch.setattr("video_crawler.download.MIN_FREE", 0)
+    started = asyncio.Event()
+
+    async def wait_for_line(*_):
+        started.set()
+        await asyncio.Future()
+
+    settings = Settings(service_token=TOKEN, profile_root=tmp_path)
+    scheduler = Scheduler(settings)
+    monkeypatch.setattr(scheduler, "lease", wait_for_line)
+    browsers = Browsers("chrome")
+    pool = IdentityPool(settings, store, scheduler, browsers)
+    downloader = Downloader(pool, scheduler, browsers, tmp_path / "videos")
+    runner = Runner(store, {DOWNLOAD_VIDEO: downloader}, SLOTS)
+    app = control_api(
+        TOKEN,
+        store,
+        runner,
+        pool,
+        scheduler,
+        downloads=downloader.progress,
+        download_speed=downloader.download_speed,
+    )
+    assert receive(store)
+    job = asyncio.create_task(runner.attempt(due(store)))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://crawler"
+    ) as api:
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            assert (await api.get("/api/download-progress")).status_code == 401
+            api.headers["Authorization"] = f"Bearer {TOKEN}"
+            response = await api.get("/api/download-progress")
+            assert response.headers["X-Download-Bytes-Per-Second"] == "0"
+            [active] = response.json()
+            assert active == {
+                "task_id": "t1",
+                "work_id": "7",
+                "stage": "preparing",
+                "received_bytes": 0,
+                "total_bytes": None,
+            }
+        finally:
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+            await scheduler._http.aclose()
+        assert (await api.get("/api/download-progress")).json() == []
 
 
 async def test_the_chrome_limit_can_grow_while_running():

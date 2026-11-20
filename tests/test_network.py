@@ -173,6 +173,47 @@ async def test_a_complete_video_is_saved_with_its_sha256(tmp_path):
     assert not path.with_suffix(".part").exists()
 
 
+@pytest.mark.parametrize("known_size", [True, False])
+async def test_transfer_reports_bytes_during_each_attempt(tmp_path, known_size, monkeypatch):
+    first = MP4.ljust(download.CHUNK, b"x")
+    last = b"remaining"
+    total = len(first) + len(last) if known_size else None
+    progress = download.DownloadProgress("task", "video", received_bytes=123, total_bytes=456)
+    rate = download.DownloadRate()
+    monkeypatch.setattr(download, "time", SimpleNamespace(monotonic=lambda: 10.2))
+    observed = []
+
+    async def chunks():
+        observed.append((progress.stage, progress.received_bytes, progress.total_bytes))
+        yield first
+        observed.append((progress.stage, progress.received_bytes, progress.total_bytes))
+        yield last
+
+    headers = {"Content-Length": str(total)} if known_size else {"Transfer-Encoding": "chunked"}
+    response = httpx.Response(200, content=chunks(), headers=headers)
+    async with media_client(response) as client:
+        await download.transfer(
+            client, "https://v16.tiktokcdn.com/a", tmp_path / "v.mp4", progress, rate=rate
+        )
+
+    assert observed == [("downloading", 0, total), ("downloading", len(first), total)]
+    assert progress.received_bytes == len(first) + len(last)
+    assert progress.total_bytes == total
+    assert rate.bytes_per_second(11) == (len(first) + len(last)) // 5
+
+
+def test_download_rate_sums_recent_transfers_and_returns_to_zero_when_idle():
+    rate = download.DownloadRate()
+    rate.record(200, 10.2)
+    rate.record(300, 10.7)
+    rate.record(1000, 11.4)
+
+    assert rate.bytes_per_second(10.9) == 0
+    assert rate.bytes_per_second(12.0) == 300
+    assert rate.bytes_per_second(16.0) == 200
+    assert rate.bytes_per_second(17.0) == 0
+
+
 @pytest.mark.parametrize(
     ("response", "url", "error"),
     [

@@ -36,11 +36,12 @@ async def serve(settings: Settings) -> None:
     scheduler = Scheduler(settings)
     browsers = Browsers(settings.chrome_channel, warm_headless=settings.warm_headless)
     pool = IdentityPool(settings, store, scheduler, browsers)
+    downloader = Downloader(pool, scheduler, browsers, settings.data_dir / "videos")
     runner = Runner(
         store,
         {
             CRAWL_CREATOR: Crawler(pool, scheduler, browsers),
-            DOWNLOAD_VIDEO: Downloader(pool, scheduler, browsers, settings.data_dir / "videos"),
+            DOWNLOAD_VIDEO: downloader,
         },
         {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0},  # 第一次心跳拿到并发数之前不开始
     )
@@ -96,7 +97,15 @@ async def serve(settings: Settings) -> None:
     token = settings.service_token.get_secret_value()
     server = uvicorn.Server(
         uvicorn.Config(
-            control_api(token, store, runner, pool, scheduler),
+            control_api(
+                token,
+                store,
+                runner,
+                pool,
+                scheduler,
+                downloads=downloader.progress,
+                download_speed=downloader.download_speed,
+            ),
             host=settings.host,
             port=settings.port,
         )

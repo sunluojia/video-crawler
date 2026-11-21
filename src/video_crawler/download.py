@@ -5,7 +5,6 @@
 下载只认 token 不认 IP，所以取地址和下载可以走不同的线路，但 token 必须来自取地址的那个身份。
 """
 
-import asyncio
 import hashlib
 import os
 import shutil
@@ -23,7 +22,7 @@ from video_crawler import tiktok
 from video_crawler.browser import Browsers, page_data, session_of
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
-from video_crawler.routes import proxy_url
+from video_crawler.routes import proxy_reachable, proxy_url
 from video_crawler.scheduler import CRAWL, DOWNLOAD, Lease, Scheduler
 from video_crawler.store import Task
 
@@ -256,7 +255,7 @@ class Downloader:
                     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as error:
                         if "407" in str(error):
                             raise Stop("代理认证失败（407）", "auth_failed") from error
-                        if not await _reachable(lease.route):
+                        if not await proxy_reachable(lease.route):
                             raise Stop(f"代理连不上：{error}", "proxy_down") from error
                         reason, outcome = f"连不上视频服务器：{error}", "suspect"
                     except httpx.HTTPError as error:
@@ -347,18 +346,3 @@ async def trusted(request: httpx.Request) -> None:
         host == name or host.endswith(f".{name}") for name in MEDIA_HOSTS
     ):
         raise Skip(f"不受信任的媒体地址：{host}")
-
-
-async def _reachable(route: dict) -> bool:
-    """复测一次代理能不能连上。直连没有代理可测。"""
-    if route["kind"] == "direct":
-        return True
-    try:
-        async with asyncio.timeout(5):
-            _, writer = await asyncio.open_connection(
-                route.get("host") or "127.0.0.1", route["port"]
-            )
-            writer.close()
-    except (OSError, TimeoutError):
-        return False
-    return True

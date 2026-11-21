@@ -101,13 +101,25 @@ class Listing:
         页面重载后再请求一次第一页没关系，作品按 ID 去重。"""
         if cursor != "0" and cursor not in self.cursors:
             return False
-        for item in page.get("itemList") or []:
+        if not isinstance(page, dict) or page.get("statusCode", 0) not in (0, "0"):
+            raise ValueError("作品列表返回失败状态或非对象")
+        more, items = page.get("hasMore"), page.get("itemList")
+        if not isinstance(more, (bool, int)) or more not in (0, 1):
+            raise ValueError("作品列表缺少有效的 hasMore")
+        if items is None and not more and ("itemList" in page or "statusCode" in page):
+            items = []
+        if not isinstance(items, list):
+            raise ValueError("作品列表缺少有效的 itemList")
+        next_cursor = page.get("cursor")
+        if more and (next_cursor is None or next_cursor == ""):
+            raise ValueError("作品列表有下一页，但没有游标")
+        for item in items:
             self.items[str(item["id"])] = item
             if not item.get("isPinnedItem"):
                 created = int(item["createTime"])
                 self.oldest = created if self.oldest is None else min(self.oldest, created)
-        self.cursors.add(str(page.get("cursor")))
-        self.ended = self.ended or not page.get("hasMore")
+        self.cursors.add(str(next_cursor))
+        self.ended = self.ended or not more
         return True
 
     @property

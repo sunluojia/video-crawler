@@ -48,6 +48,21 @@ async def socks5_answers(host: str, port: int) -> bool:
     return answer[:1] == b"\x05"
 
 
+async def proxy_reachable(route: dict) -> bool:
+    """复查代理端口能否连接。直连没有代理端口。"""
+    if route["kind"] == "direct":
+        return True
+    try:
+        async with asyncio.timeout(5):
+            _, writer = await asyncio.open_connection(
+                route.get("host") or "127.0.0.1", route["port"]
+            )
+            writer.close()
+    except (OSError, TimeoutError):
+        return False
+    return True
+
+
 @asynccontextmanager
 async def browser_proxy(route: dict) -> AsyncIterator[dict | None]:
     """浏览器用的代理设置；带口令的代理先在本机开一个无口令的转发口。"""

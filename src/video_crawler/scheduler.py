@@ -4,6 +4,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -16,6 +17,8 @@ log = logging.getLogger(__name__)
 CRAWL, DOWNLOAD = "crawler.crawl_creator", "crawler.download_video"
 """申请线路的用途：获取信息、下载视频。"""
 USE_NAMES = {CRAWL: "采集", DOWNLOAD: "下载"}
+type ListingResult = Literal["complete", "empty_response", "read_failed"]
+MAX_RETRY_AFTER = 2_147_483_647
 
 
 @dataclass
@@ -54,11 +57,19 @@ class Scheduler:
         return Lease(grant["lease_id"], grant["line"], grant["route"])
 
     async def release(
-        self, lease: Lease, outcome: str, detail: str | None = None, retry_after: int | None = None
+        self,
+        lease: Lease,
+        outcome: str,
+        detail: str | None = None,
+        retry_after: int | None = None,
+        *,
+        listing_result: ListingResult | None = None,
     ) -> None:
         """归还线路并报告表现：normal、suspect、proxy_down、auth_failed、throttled。"""
         self.leases.discard(lease.id)
         body = {"outcome": outcome, "detail": detail and detail[:500], "retry_after": retry_after}
+        if listing_result is not None:
+            body["listing_result"] = listing_result
         try:
             response = await self._http.post(f"/api/proxy-leases/{lease.id}/release", json=body)
             response.raise_for_status()

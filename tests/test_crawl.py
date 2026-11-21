@@ -1,7 +1,8 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -12,6 +13,7 @@ import pytest
 from video_crawler import crawl
 from video_crawler.api import control_api
 from video_crawler.browser import Session
+from video_crawler.errors import Retry, Wait
 from video_crawler.identities import Identity
 from video_crawler.runner import Runner
 from video_crawler.scheduler import CRAWL, Lease
@@ -62,9 +64,11 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
 
     async def respond(cursor, next_cursor, items, *, more):
         data = {"cursor": next_cursor, "itemList": items, "hasMore": more}
-        await handler.call_args.args[1](
+        await handler.call_args_list[0].args[1](
             SimpleNamespace(
                 url=f"https://www.tiktok.com/api/post/item_list/?cursor={cursor}",
+                status=200,
+                headers={},
                 body=AsyncMock(return_value=json.dumps(data).encode()),
             )
         )
@@ -131,7 +135,9 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
 
     browsers.open.assert_called_once()
     scheduler.lease.assert_awaited_once_with(CRAWL, task.task_id, [])
-    scheduler.release.assert_awaited_once_with(lease, "normal", None)
+    scheduler.release.assert_awaited_once_with(
+        lease, "normal", None, None, listing_result="complete"
+    )
     pool.refreshed.assert_called_once_with(identity, session)
     pool.give_back.assert_called_once_with(identity, "ok")
 
@@ -146,3 +152,159 @@ async def test_listing_is_skipped_for_private_or_missing_creators(monkeypatch, c
         "profile": None,
     }
     assert progress.stage == "profile"
+
+
+@pytest.fixture
+def listing_attempt(monkeypatch):
+    task = Task(
+        "task",
+        1,
+        "crawl_creator",
+        "batch",
+        {"creator": {"handle": "alice"}, "cutoff": "2026-11-20T00:00:00Z", "max_works": 5},
+    )
+    lease = Lease("lease", "proxy:test", {"kind": "proxy"})
+    scheduler = SimpleNamespace(lease=AsyncMock(return_value=lease), release=AsyncMock())
+    pool = SimpleNamespace(take=Mock(), profile=Mock(), note=Mock(), give_back=Mock())
+    handlers = {}
+    page = SimpleNamespace(
+        on=lambda event, callback: handlers.update({event: callback}),
+        reload=AsyncMock(),
+        mouse=SimpleNamespace(wheel=AsyncMock()),
+    )
+
+    @asynccontextmanager
+    async def open_browser(profile, route):
+        yield page
+
+    browsers = SimpleNamespace(open=open_browser)
+    monkeypatch.setattr(crawl, "session_of", AsyncMock(return_value=None))
+    crawler = crawl.Crawler(pool, scheduler, browsers)
+
+    def with_profile(side_effect):
+        monkeypatch.setattr(crawl, "_read_profile", AsyncMock(side_effect=side_effect))
+
+    return SimpleNamespace(
+        task=task,
+        lease=lease,
+        release=scheduler.release,
+        page=page,
+        handlers=handlers,
+        note=pool.note,
+        with_profile=with_profile,
+        run=crawler,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "result", "detail", "reloads"),
+    [
+        (200, b'{"statusCode": 0, "hasMore": false}', "complete", "无符合条件的作品", 0),
+        (200, b"", "empty_response", "两次返回空正文", 1),
+        (200, crawl.BrowserError("body unavailable"), "read_failed", "正文读取失败", 0),
+        (200, b'{"statusCode": 1, "hasMore": false}', "read_failed", "列表格式不对", 0),
+        (200, b"{}", "read_failed", "列表格式不对", 0),
+        (503, b"", "read_failed", "HTTP 503", 0),
+        (429, b"", None, "限流（429）", 0),
+        (407, b"", None, "代理认证失败（407）", 0),
+    ],
+)
+async def test_listing_reports_distinct_response_failures(
+    listing_attempt, status, body, result, detail, reloads
+):
+    attempt = listing_attempt
+    read = (
+        AsyncMock(side_effect=body) if isinstance(body, Exception) else AsyncMock(return_value=body)
+    )
+
+    async def respond(*_, **__):
+        await attempt.handlers["response"](
+            SimpleNamespace(
+                url="https://www.tiktok.com/api/post/item_list/?cursor=0",
+                status=status,
+                headers={"retry-after": "120"},
+                body=read,
+            )
+        )
+        return None, None
+
+    attempt.with_profile(respond)
+
+    # 模拟浏览器导航方法只返回导航响应，列表响应通过事件送达。
+    async def reload_page(**_):
+        await respond()
+
+    attempt.page.reload.side_effect = reload_page
+    if result == "complete":
+        assert (await attempt.run(attempt.task))["works"] == []
+        outcome, seconds = "normal", None
+    elif status in (429, 407):
+        with pytest.raises(Wait, match=detail) as caught:
+            await attempt.run(attempt.task)
+        outcome, seconds = ("throttled", 120) if status == 429 else ("auth_failed", None)
+        assert caught.value.seconds == (seconds or 60)
+        read.assert_not_awaited()
+    else:
+        with pytest.raises(Retry, match=detail):
+            await attempt.run(attempt.task)
+        outcome, seconds = "suspect", None
+
+    args, fields = attempt.release.await_args
+    assert args[:2] == (attempt.lease, outcome)
+    assert detail in args[2] and args[3] == seconds
+    assert fields["listing_result"] == result
+    assert attempt.page.reload.await_count == reloads
+    if isinstance(body, Exception):
+        attempt.note.assert_not_called()
+
+
+@pytest.mark.parametrize("reachable", [True, False])
+async def test_a_listing_proxy_error_requires_a_failed_connection_check(
+    listing_attempt, monkeypatch, reachable
+):
+    attempt = listing_attempt
+    probe = AsyncMock(return_value=reachable)
+    monkeypatch.setattr(crawl, "proxy_reachable", probe)
+
+    async def profile(*_):
+        attempt.handlers["requestfailed"](
+            SimpleNamespace(
+                url="https://www.tiktok.com/api/post/item_list/",
+                failure="net::ERR_TUNNEL_CONNECTION_FAILED",
+            )
+        )
+        return None, None
+
+    attempt.with_profile(profile)
+    with pytest.raises(Retry if reachable else Wait):
+        await attempt.run(attempt.task)
+    probe.assert_awaited_once_with(attempt.lease.route)
+    assert attempt.release.await_args.args[1] == ("suspect" if reachable else "proxy_down")
+    assert attempt.release.await_args.kwargs["listing_result"] == (
+        "read_failed" if reachable else None
+    )
+
+
+async def test_an_idle_listing_returns_its_lease_without_reloading_the_profile(
+    listing_attempt, monkeypatch
+):
+    attempt = listing_attempt
+    monkeypatch.setattr(crawl, "WAIT_PAGE", 0.01)
+
+    async def profile(*_):
+        return None, None
+
+    attempt.with_profile(profile)
+    with pytest.raises(Retry, match="等待响应超时"):
+        await attempt.run(attempt.task)
+    attempt.page.mouse.wheel.assert_awaited_once()
+    attempt.page.reload.assert_not_awaited()
+    assert attempt.release.await_args.kwargs["listing_result"] == "read_failed"
+
+
+def test_retry_after_accepts_seconds_http_dates_and_missing_headers():
+    assert crawl._retry_after("7200") == 7200
+    date = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
+    assert 118 <= crawl._retry_after(date) <= 120
+    assert crawl._retry_after("later") == 60
+    assert crawl._retry_after(None) == 60

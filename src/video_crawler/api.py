@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from video_crawler.crawl import CrawlProgress
 from video_crawler.download import DownloadProgress
 from video_crawler.identities import IdentityPool
 from video_crawler.proxycheck import check_proxy, measure_speed
@@ -27,6 +28,7 @@ def control_api(
     scheduler: Scheduler,
     downloads: Callable[[], list[DownloadProgress]] = list,
     download_speed: Callable[[], int] | None = None,
+    crawls: Callable[[], list[CrawlProgress]] = list,
 ) -> FastAPI:
     def authorized(
         credentials: Annotated[
@@ -92,6 +94,11 @@ def control_api(
                 datetime.fromtimestamp(runner.paused_until, UTC).isoformat() if paused else None
             ),
         }
+
+    @app.get("/api/crawl-progress")
+    async def crawl_progress() -> list[CrawlProgress]:
+        """正在获取达人资料或作品列表的任务。"""
+        return crawls()
 
     @app.get("/api/download-progress")
     async def download_progress(response: Response) -> list[DownloadProgress]:

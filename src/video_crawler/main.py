@@ -36,11 +36,12 @@ async def serve(settings: Settings) -> None:
     scheduler = Scheduler(settings)
     browsers = Browsers(settings.chrome_channel, warm_headless=settings.warm_headless)
     pool = IdentityPool(settings, store, scheduler, browsers)
+    crawler = Crawler(pool, scheduler, browsers)
     downloader = Downloader(pool, scheduler, browsers, settings.data_dir / "videos")
     runner = Runner(
         store,
         {
-            CRAWL_CREATOR: Crawler(pool, scheduler, browsers),
+            CRAWL_CREATOR: crawler,
             DOWNLOAD_VIDEO: downloader,
         },
         {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0},  # 第一次心跳拿到并发数之前不开始
@@ -111,6 +112,7 @@ async def serve(settings: Settings) -> None:
                 scheduler,
                 downloads=downloader.progress,
                 download_speed=downloader.download_speed,
+                crawls=crawler.progress,
             ),
             host=settings.host,
             port=settings.port,

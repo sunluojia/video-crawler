@@ -8,6 +8,7 @@
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
@@ -95,11 +96,11 @@ class Listing:
     oldest: int | None = None
     """读到的最早的普通作品的发布时间（秒）。"""
 
-    def add(self, cursor: str, page: dict) -> None:
+    def add(self, cursor: str, page: dict) -> bool:
         """加一页。请求游标接不上已读页的不收，保证从第一页起没有缺页；
         页面重载后再请求一次第一页没关系，作品按 ID 去重。"""
         if cursor != "0" and cursor not in self.cursors:
-            return
+            return False
         for item in page.get("itemList") or []:
             self.items[str(item["id"])] = item
             if not item.get("isPinnedItem"):
@@ -107,15 +108,24 @@ class Listing:
                 self.oldest = created if self.oldest is None else min(self.oldest, created)
         self.cursors.add(str(page.get("cursor")))
         self.ended = self.ended or not page.get("hasMore")
+        return True
 
     @property
     def started(self) -> bool:
         return bool(self.cursors)
 
-    def _ranked(self) -> list[dict]:
+    def _eligible(self) -> Iterator[dict]:
         cutoff = self.cutoff.timestamp()
-        eligible = [item for item in self.items.values() if int(item["createTime"]) <= cutoff]
-        return sorted(eligible, key=lambda item: (-int(item["createTime"]), -int(item["id"])))
+        return (item for item in self.items.values() if int(item["createTime"]) <= cutoff)
+
+    @property
+    def candidate_count(self) -> int:
+        return min(self.limit, sum(1 for _ in self._eligible()))
+
+    def _ranked(self) -> list[dict]:
+        return sorted(
+            self._eligible(), key=lambda item: (-int(item["createTime"]), -int(item["id"]))
+        )
 
     @property
     def settled(self) -> bool:

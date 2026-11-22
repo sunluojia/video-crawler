@@ -28,6 +28,7 @@ def pool(tmp_path) -> IdentityPool:
     store = Store(tmp_path / "state.db")
     pool = IdentityPool(settings, store, Scheduler(settings), Browsers("chrome"))
     pool.target = 3
+    pool.browser = "146"
     return pool
 
 
@@ -94,11 +95,83 @@ def test_the_pool_tops_up_to_what_the_scheduler_assigns(pool):
     pool.target = 0
     assert pool._next() is None  # 第一次心跳拿到数量之前不新建
     pool.target = 2
-    add(pool, "a", fails=3)
+    blocked = add(pool, "a", fails=3)
     assert pool._next() is not None  # 连续失败的不计入，补新的
     for name in "bcd":
         add(pool, name, fails=3)
     assert pool._next() is None  # 最多保留目标的两倍
+    blocked.warmed_at = 0
+    blocked.cooldown_until = time.time() + 60
+    assert pool._next() is None
+    blocked.cooldown_until = 0
+    assert pool._next() is blocked  # 无法新建时，冷却结束的资料仍能恢复
+
+
+def test_refill_recovers_expired_profiles_before_refreshing_live_sessions(pool):
+    expiring = add(pool, "expiring")
+    expiring.warmed_at -= identities.REFRESH_AFTER
+    expired = add(pool, "expired")
+    expired.warmed_at -= identities.TOKEN_TTL
+    busy = add(pool, "busy", busy=True)
+    busy.warmed_at -= identities.TOKEN_TTL
+    add(pool, "cooling", warmed=False, fails=1, cooldown_until=time.time() + 60)
+
+    assert pool._next() is expired
+    pool.refreshed(expired, expiring.session)
+
+    created = pool._next()
+    assert created is not None and created.id not in pool.identities
+    created.browser = pool.browser
+    pool.refreshed(created, expiring.session)
+    pool.identities[created.id] = created
+    assert pool._next() is expiring
+
+
+async def test_success_and_blocked_return_refill_without_waiting_for_poll(pool, monkeypatch):
+    monkeypatch.setattr(identities, "CHECK_EVERY", 60)
+    completed = asyncio.Queue()
+
+    async def warm(identity: Identity) -> bool:
+        identity.browser = pool.browser
+        pool.refreshed(identity, Session({"tt_chain_token": "test"}, "ua", "146"))
+        pool.identities[identity.id] = identity
+        completed.put_nowait(identity)
+        return True
+
+    monkeypatch.setattr(pool, "_warm", warm)
+    pool.configure(3, 1)
+    loop = asyncio.create_task(pool.run())
+    try:
+        first = await asyncio.wait_for(completed.get(), 1)
+        await asyncio.wait_for(completed.get(), 1)
+        await asyncio.wait_for(completed.get(), 1)
+        assert pool.summary()["ready"] == 3
+
+        assert pool.take() is first
+        pool.give_back(first, "blocked")
+        replacement = await asyncio.wait_for(completed.get(), 1)
+        assert replacement.id != first.id
+        assert first.cooldown_until > time.time()
+        assert pool.summary()["ready"] == 3
+    finally:
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+
+
+async def test_failed_warm_gives_another_profile_a_chance(pool, monkeypatch):
+    monkeypatch.setattr(identities, "CHECK_EVERY", 0)
+    failing = add(pool, "failing", warmed=False, busy=True)
+    other = add(pool, "other", warmed=False)
+    pool._warming[failing.id] = failing
+    monkeypatch.setattr(pool, "_warm", AsyncMock(return_value=False))
+
+    await pool._attempt(failing)
+
+    assert failing.warm_retry_at > time.time()
+    assert pool._next() is other
+    failing.warm_retry_at = 0
+    assert pool._next() is failing
 
 
 async def test_warming_can_resize_and_reserves_each_profile_and_target_slot(pool, monkeypatch):
@@ -107,12 +180,14 @@ async def test_warming_can_resize_and_reserves_each_profile_and_target_slot(pool
     started = asyncio.Queue()
     gates = {}
 
-    async def warm(identity: Identity) -> None:
+    async def warm(identity: Identity) -> bool:
         gates[identity.id] = asyncio.Event()
         started.put_nowait(identity)
         await gates[identity.id].wait()
+        identity.browser = pool.browser
         pool.refreshed(identity, Session({"tt_chain_token": "test"}, "ua", "146"))
         pool.identities[identity.id] = identity
+        return True
 
     monkeypatch.setattr(pool, "_warm", warm)
     loop = asyncio.create_task(pool.run())
@@ -189,11 +264,13 @@ async def test_stopping_parallel_warmers_returns_leases_and_removes_unfinished_p
 
 
 def test_refresh_and_retire_from_the_page(pool):
+    pool.target = 1
     ready, busy = add(pool, "ready"), add(pool, "busy", busy=True)
     client = control(pool)
 
     assert client.post("/api/identities/ready/refresh").status_code == 204
-    assert not ready.fresh(time.time())  # 后台循环下一个就预热它
+    assert not ready.fresh(time.time())
+    assert pool._next() is ready  # 已达到目标时仍能手动刷新
     assert client.post("/api/identities/busy/retire").status_code == 409
     assert client.post("/api/identities/nobody/retire").status_code == 404
     assert client.post("/api/identities/ready/retire").status_code == 204

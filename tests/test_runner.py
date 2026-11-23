@@ -51,15 +51,18 @@ def test_duplicate_and_older_runs_are_ignored_and_newer_runs_replace(store):
     assert types(store) == ["accepted", "accepted"]
 
 
-def test_paused_batches_wait_and_cancelled_batches_are_dropped(store):
-    receive(store, task_id="t1", batch_id="b1")
+def test_paused_batches_hold_crawls_and_cancelled_batches_are_dropped(store):
+    receive(store, kind=CRAWL_CREATOR, task_id="t1", batch_id="b1")
+    receive(store, task_id="t2", batch_id="b1")
     store.pause("b1")
-    assert due(store) is None
+    assert due(store, CRAWL_CREATOR) is None
+    assert due(store).task_id == "t2"  # 暂停采集时下载照常
     store.resume("b1")
-    assert due(store).task_id == "t1"
+    assert due(store, CRAWL_CREATOR).task_id == "t1"
     store.cancel_batch("b1")
+    assert due(store, CRAWL_CREATOR) is None
     assert due(store) is None
-    assert not receive(store, task_id="t2", batch_id="b1")  # 取消后迟到的任务
+    assert not receive(store, task_id="t3", batch_id="b1")  # 取消后迟到的任务
 
 
 def runner_with(store: Store, outcome) -> Runner:
@@ -88,6 +91,17 @@ async def test_three_failed_attempts_report_every_reason(store):
     assert final["reason"].count("视频服务器拒绝（403）") == 3
 
 
+async def test_a_failed_crawl_reports_the_profile_it_read(store):
+    receive(store, kind=CRAWL_CREATOR)
+    error = Retry("作品列表等待响应超时", "1.2.3.4")
+    error.profile = {"handle": "bob"}
+    runner = runner_with(store, error)
+    for _ in range(3):
+        await runner.attempt(due(store, CRAWL_CREATOR))
+    final = store.events()[-1]
+    assert (final["conclusion"], final["profile"]) == ("failed", {"handle": "bob"})
+
+
 async def test_waiting_does_not_count_and_holds_back_crawls(store):
     receive(store)
     runner = runner_with(store, Wait(30, "没有采集线路：线路都在冷却或限流", CRAWL))
@@ -98,7 +112,7 @@ async def test_waiting_does_not_count_and_holds_back_crawls(store):
     assert task.waiting == "没有采集线路：线路都在冷却或限流"
     assert "t1" in runner.starved  # 有下载在等采集线路，先不开始新的获取作品
 
-    runner.forget("b1")  # 批次暂停后不再挡着
+    runner.forget("b1")  # 批次取消后不再挡着
     assert not runner.starved
 
 

@@ -41,9 +41,11 @@ def event(task_id: str, run: int, type_: str, **fields) -> dict:
     }
 
 
-def failed(task: Task, reason: str) -> dict:
+def failed(task: Task, reason: str, profile: dict | None = None) -> dict:
     if task.kind == CRAWL_CREATOR:
-        return event(task.task_id, task.run, "crawled", conclusion="failed", reason=reason)
+        return event(
+            task.task_id, task.run, "crawled", conclusion="failed", reason=reason, profile=profile
+        )
     return event(task.task_id, task.run, "download_failed", reason=reason)
 
 
@@ -100,7 +102,7 @@ class Runner:
         self.forget(batch_id)
 
     def forget(self, batch_id: str | None) -> None:
-        """批次暂停或取消后，它的下载不再算在等采集线路，免得挡住其他批次的获取作品。"""
+        """批次取消后，它的下载不再算在等采集线路，免得挡住其他批次的获取作品。"""
         for waiting, batch in list(self.starved.items()):
             if batch == batch_id:
                 del self.starved[waiting]
@@ -146,7 +148,8 @@ class Runner:
         log.warning("%s %s 第 %s 次没成：%s", task.kind, task.task_id, task.attempts, reason)
         self._count(task, ok=False)
         if task.attempts >= MAX_ATTEMPTS:
-            self._store.finish(task, failed(task, "；".join(task.history)))
+            profile = error.profile if isinstance(error, Retry) else None
+            self._store.finish(task, failed(task, "；".join(task.history), profile))
             return
         delay = BACKOFF[task.attempts - 1] * random.uniform(0.8, 1.2)
         task.next_at, task.waiting = time.time() + delay, reason

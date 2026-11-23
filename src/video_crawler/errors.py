@@ -14,6 +14,9 @@ class Wait(Exception):
 class Retry(Exception):
     """这次没做成：算一次尝试，稍后避开出问题的线路再试。"""
 
+    profile: dict | None = None
+    """这次已经读到的达人资料。最后一次也没成时随失败事件回传，调度中心据此分清卡在主页还是作品列表。"""
+
     def __init__(self, reason: str, line: str | None = None) -> None:
         super().__init__(reason)
         self.reason, self.line = reason, line

@@ -166,8 +166,22 @@ async def _read(
         return {"conclusion": conclusion, "profile": profile}
 
     listing = tiktok.Listing(datetime.fromisoformat(body["cutoff"]), progress.max_works)
-    works = await _read_listing(page, pages, listing, line, progress)
+    try:
+        works = await _read_listing(page, pages, listing, line, progress)
+    except ListingFailure as failure:
+        if await _needs_login(page):
+            return {"conclusion": "login_required", "profile": profile}
+        failure.profile = profile
+        raise
     return {"conclusion": "ok", "profile": profile, "works": works}
+
+
+async def _needs_login(page: Page) -> bool:
+    """读不到作品列表时看一眼页面：达人开了受众控制的，访客怎么重试都看不到。"""
+    try:
+        return tiktok.needs_login(await page.evaluate("document.body.innerText"))
+    except BrowserError:
+        return False
 
 
 async def _read_profile(page: Page, handle: str, line: str) -> tuple[str | None, dict | None]:

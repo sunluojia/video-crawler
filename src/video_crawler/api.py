@@ -43,10 +43,10 @@ def control_api(
 
     @app.post("/api/batches/{batch_id}/{action}", status_code=204)
     async def control_batch(batch_id: str, action: str) -> None:
-        """暂停只是不开始新的尝试；取消关掉进行中的尝试，之后收到的任务也丢掉。"""
+        """暂停采集：不再开始新的获取作品，进行中的做完，下载照常；
+        取消关掉进行中的尝试，之后收到的任务也丢掉。"""
         if action == "pause":
             store.pause(batch_id)
-            runner.forget(batch_id)
         elif action == "resume":
             store.resume(batch_id)
             runner.wake()

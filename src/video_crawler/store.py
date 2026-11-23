@@ -119,10 +119,11 @@ class Store:
             return True
 
     def due(self, kind: str, now: float, running: set[str]) -> Task | None:
-        """按收到的先后，取一个到了时间、批次没暂停的任务。"""
+        """按收到的先后，取一个到了时间的任务。批次暂停采集时不开始新的获取作品，下载照常。"""
         rows = self._read(
             "SELECT * FROM tasks WHERE kind = ? AND done = 0 AND next_at <= ?"
-            " AND batch_id NOT IN (SELECT batch_id FROM batches) ORDER BY received_at",
+            " AND (kind != 'crawl_creator' OR batch_id NOT IN (SELECT batch_id FROM batches))"
+            " ORDER BY received_at",
             kind,
             now,
         )

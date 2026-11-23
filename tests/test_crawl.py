@@ -171,6 +171,7 @@ def listing_attempt(monkeypatch):
         on=lambda event, callback: handlers.update({event: callback}),
         reload=AsyncMock(),
         mouse=SimpleNamespace(wheel=AsyncMock()),
+        evaluate=AsyncMock(return_value="Videos Reposts Liked"),
     )
 
     @asynccontextmanager
@@ -300,6 +301,26 @@ async def test_an_idle_listing_returns_its_lease_without_reloading_the_profile(
     attempt.page.mouse.wheel.assert_awaited_once()
     attempt.page.reload.assert_not_awaited()
     assert attempt.release.await_args.kwargs["listing_result"] == "read_failed"
+
+
+@pytest.mark.parametrize("notice", [None, "This creator turned on\naudience controls"])
+async def test_an_unreadable_listing_is_login_required_or_keeps_the_profile(
+    listing_attempt, monkeypatch, notice
+):
+    """开了受众控制的达人直接得出结论；其他读不到列表的情况带着资料重试。"""
+    attempt = listing_attempt
+    monkeypatch.setattr(crawl, "WAIT_PAGE", 0.01)
+    found = {"handle": "alice", "url": "https://www.tiktok.com/@alice"}
+    attempt.with_profile(AsyncMock(return_value=(None, found)))
+    if notice:
+        attempt.page.evaluate.return_value = notice
+        result = await attempt.run(attempt.task)
+        assert result == {"conclusion": "login_required", "profile": found}
+        assert attempt.release.await_args.args[1] == "normal"
+    else:
+        with pytest.raises(Retry) as caught:
+            await attempt.run(attempt.task)
+        assert caught.value.profile == found
 
 
 def test_retry_after_accepts_seconds_http_dates_and_missing_headers():

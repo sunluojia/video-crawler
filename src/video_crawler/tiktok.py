@@ -38,8 +38,17 @@ def scope_in_html(html: str) -> dict | None:
     return scope(match and match[1])
 
 
+AUDIENCE_CONTROLS = "this creator turned on audience controls"
+"""达人开启受众控制时主页上的提示，取自旧系统实际遇到的页面；这类达人要登录才能看作品。"""
+
+
+def needs_login(page_text: str) -> bool:
+    return AUDIENCE_CONTROLS in " ".join(page_text.casefold().split())
+
+
 def profile_of(data: dict, handle: str) -> tuple[str | None, dict | None]:
-    """主页数据里的结论和资料：结论为 private、not_found，公开账号为 None。"""
+    """主页数据里的结论和资料：结论为 private、not_found，公开账号为 None。
+    需要登录（login_required）要等作品列表读不到时看页面文字才知道，见 needs_login。"""
     detail = data.get("webapp.user-detail") or {}
     user = (detail.get("userInfo") or {}).get("user")
     if not user:

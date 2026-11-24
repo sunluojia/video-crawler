@@ -1,15 +1,19 @@
 """下载一条视频（download_video），见单视频下载方案第 2、3 节和爬取方案第 5 节。
 
-一次尝试：要一条下载线路 → 挑一个身份，经采集线路带它的 Cookie 读作品页拿到媒体地址
-→ 带同一个身份的 tt_chain_token 经下载线路下载 → 校验、落盘 → 上传。
-下载只认 token 不认 IP，所以取地址和下载可以走不同的线路，但 token 必须来自取地址的那个身份。
+优先复用同身份从列表拿到的媒体地址。需要读作品页时借采集线路，归还后再借下载线路拉取媒体。
+下载使用同一身份的 token，传输完成后校验、落盘并上传。
 """
 
+import errno
 import hashlib
+import logging
 import os
+import re
 import shutil
 import time
 from collections import deque
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,15 +28,14 @@ from video_crawler.crawl import retry_after_seconds
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.routes import proxy_reachable, proxy_url
-from video_crawler.scheduler import CRAWL, DOWNLOAD, Lease, Scheduler
-from video_crawler.store import Task
+from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease, Scheduler
+from video_crawler.settings import SLOW_BYTES, SLOW_WINDOW
+
+log = logging.getLogger(__name__)
 
 MAX_BYTES = 512 * 1024 * 1024
 MIN_FREE = 10 * 1024**3
 """磁盘至少留这么多空闲，不够就等。"""
-CHUNK = 256 * 1024
-SLOW_BYTES, SLOW_WINDOW = 100 * 1024, 30
-"""连续 30 秒平均低于 100 KB/s（包括完全收不到数据）就断开。"""
 RATE_WINDOW_SECONDS = 5
 MAX_TRANSFERS = 3
 MEDIA_HOSTS = (
@@ -51,18 +54,24 @@ WAITING = {"proxy_down", "auth_failed", "throttled"}
 
 
 class Stop(Exception):
-    """这次尝试到此为止。outcome 是报给下载线路的表现，blocked 表示身份的 token 被拒。"""
+    """线路阶段失败。blocked 表示 token 被拒，stale 表示缓存地址应重新获取。"""
 
     def __init__(
-        self, reason: str, outcome: str = "suspect", retry_after: int | None = None, blocked=False
+        self,
+        reason: str,
+        outcome: str = "suspect",
+        retry_after: int | None = None,
+        *,
+        blocked: bool = False,
+        stale: bool = False,
     ) -> None:
         super().__init__(reason)
-        self.reason, self.outcome, self.retry_after, self.blocked = (
-            reason,
-            outcome,
-            retry_after,
-            blocked,
-        )
+        self.reason, self.outcome, self.retry_after = reason, outcome, retry_after
+        self.blocked, self.stale = blocked, stale
+
+
+class _Blocked(Retry):
+    """用当前身份重新取链后，媒体服务器仍然拒绝 token。"""
 
 
 class Skip(Exception):
@@ -106,10 +115,20 @@ class DownloadRate:
 
 class Downloader:
     def __init__(
-        self, pool: IdentityPool, scheduler: Scheduler, browsers: Browsers, folder: Path
+        self,
+        pool: IdentityPool,
+        scheduler: Scheduler,
+        browsers: Browsers,
+        folder: Path,
+        *,
+        media_cache: tiktok.MediaCache | None = None,
+        slow_bytes: int = SLOW_BYTES,
+        slow_window: float = SLOW_WINDOW,
     ) -> None:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
         self._folder = folder
+        self._media = media_cache or tiktok.MediaCache()
+        self._slow_bytes, self._slow_window = slow_bytes, slow_window
         self._active: dict[str, DownloadProgress] = {}
         self._rate = DownloadRate()
         folder.mkdir(parents=True, exist_ok=True)
@@ -120,106 +139,137 @@ class Downloader:
     def download_speed(self) -> int:
         return self._rate.bytes_per_second(time.monotonic())
 
-    async def __call__(self, task: Task) -> None:
+    async def __call__(self, task: ClaimedTask) -> None:
         """一次尝试；成功时视频已经上传，不另发事件。"""
         if shutil.disk_usage(self._folder).free < MIN_FREE:
             raise Wait(60, "磁盘空间不足")
+        path = self._folder / f"{task.task_id}-{task.run}-{task.attempt_id}.mp4"
         progress = DownloadProgress(task.task_id, task.body["work"]["work_id"])
-        self._active[task.task_id] = progress
+        self._active[task.attempt_id] = progress
         try:
-            await self._download(task, progress)
+            await self._download(task, progress, path)
+        except OSError as error:
+            if error.errno != errno.ENOSPC:
+                raise
+            raise Wait(60, "磁盘空间不足") from error
         finally:
-            self._active.pop(task.task_id, None)
+            self._active.pop(task.attempt_id, None)
+            _remove_file(path)
 
-    async def _download(self, task: Task, progress: DownloadProgress) -> None:
-        path = self._folder / f"{task.task_id}-{task.run}.mp4"
-        lease = await self._scheduler.lease(DOWNLOAD, task.task_id, task.avoid)
-        identity, result = None, "neutral"
-        outcome, detail, retry_after = "normal", None, None
+    async def _download(self, task: ClaimedTask, progress: DownloadProgress, path: Path) -> None:
+        cached = self._media.get(progress.work_id)
+        identity = self._pool.take(preferred_id=cached.identity_id if cached else None)
+        result = "neutral"
         try:
-            identity = self._pool.take()
-            candidates = await self._address(task, identity)
-            sha256 = await self._fetch(
-                lease, identity, task.body["work"]["url"], candidates, path, progress
-            )
+            sha256 = None
+            if cached and identity.id == cached.identity_id:
+                sha256 = await self._fetch_media(
+                    task, identity, cached.urls, path, progress, cached=cached
+                )
+            if sha256 is None:
+                progress.stage, progress.received_bytes, progress.total_bytes = "preparing", 0, None
+                async with self._route(CRAWL, task) as lease:
+                    candidates = await self._address(lease, task, identity)
+                sha256 = await self._fetch_media(task, identity, candidates, path, progress)
+            assert sha256 is not None
             result = "ok"
-        except Stop as stop:
-            outcome, detail, retry_after = stop.outcome, stop.reason, stop.retry_after
-            result = "blocked" if stop.blocked else result
-            if outcome in WAITING:
-                raise Wait(retry_after or 60, stop.reason) from None
-            raise Retry(stop.reason, lease.line) from None
+        except _Blocked:
+            result = "blocked"
+            raise
         finally:
-            await self._scheduler.release(lease, outcome, detail, retry_after)
-            if identity:
-                self._pool.give_back(identity, result)
-                self._pool.note("download", result != "blocked")
+            self._pool.give_back(identity, result)
         progress.stage, progress.total_bytes = "uploading", progress.received_bytes
         try:
             status = await self._scheduler.upload(task, path, sha256)
         except httpx.HTTPError as error:
             raise Wait(30, f"上传时调度中心连不上：{error}") from error
-        finally:
-            path.unlink(missing_ok=True)
         if status == 422:
             raise Retry("上传后调度中心核对不上大小或 SHA-256")
         if status not in (204, 404, 409):  # 404、409：任务取消或已有新轮次，文件不要了
             raise Wait(30, f"上传返回 {status}")
 
-    async def _address(self, task: Task, identity: Identity) -> list[str]:
-        """经采集线路读作品页，拿到媒体地址候选。先用 HTTP 带身份的 Cookie 读，
-        拿到挑战页或没有页面数据时，再用这个身份的浏览器打开。"""
+    @asynccontextmanager
+    async def _route(self, use: str, task: ClaimedTask) -> AsyncIterator[Lease]:
+        lease = await self._scheduler.lease(
+            use, task.task_id, task.avoid, attempt_id=task.attempt_id
+        )
+        outcome, detail, retry_after = "normal", None, None
+        try:
+            yield lease
+        except Stop as stop:
+            outcome, detail, retry_after = stop.outcome, stop.reason, stop.retry_after
+            if outcome in WAITING:
+                raise Wait(retry_after or 60, detail, use) from None
+            error = _Blocked if stop.blocked else Retry
+            raise error(detail, lease.line) from None
+        finally:
+            await self._scheduler.release(lease, outcome, detail, retry_after)
+
+    async def _fetch_media(
+        self,
+        task: ClaimedTask,
+        identity: Identity,
+        candidates: Sequence[str],
+        path: Path,
+        progress: DownloadProgress,
+        *,
+        cached: tiktok.MediaLinks | None = None,
+    ) -> str | None:
+        async with self._route(DOWNLOAD, task) as lease:
+            blocked = False
+            try:
+                return await self._fetch(
+                    lease, identity, task.body["work"]["url"], candidates, path, progress
+                )
+            except Stop as stop:
+                if cached and stop.stale:
+                    self._media.discard(progress.work_id, cached)
+                    return None
+                blocked = stop.blocked
+                raise
+            finally:
+                self._pool.note("download", not blocked)
+
+    async def _address(self, lease: Lease, task: ClaimedTask, identity: Identity) -> list[str]:
+        """带身份 Cookie 走采集线路取地址，页面资料不足时用同线路打开 Chrome。"""
         work = task.body["work"]
-        lease = await self._scheduler.lease(CRAWL, task.task_id, task.avoid)
-        outcome, detail, retry_after = "suspect", None, None
         try:
             proxy = await proxy_url(lease.route)
             async with AsyncSession(
-                impersonate="chrome", proxy=proxy, trust_env=proxy is not None, timeout=30
+                impersonate="chrome", proxy=proxy, trust_env=False, timeout=30
             ) as http:
                 response = await http.get(
                     work["url"],
                     headers={"User-Agent": identity.session.user_agent},
                     cookies=identity.session.cookies,
                 )
-            if response.status_code == 429:
-                retry_after = retry_after_seconds(response.headers.get("Retry-After"))
-                outcome, detail = "throttled", "读作品页被限流（429）"
-                raise Wait(retry_after, detail)
-            data = tiktok.scope_in_html(response.text) if response.status_code == 200 else None
-            if data is None:
-                async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
-                    await page.goto(work["url"], wait_until="domcontentloaded")
-                    data = await page_data(page)
-                    self._pool.refreshed(identity, await session_of(page))
-            if data is None:
-                raise Retry("作品页没有页面数据，可能停在了挑战页", lease.line)
-            candidates = tiktok.media_of(data, work["work_id"])
-            if not candidates:
-                raise Retry("作品页里没有媒体地址", lease.line)
-            outcome = "normal"
-            return candidates
+            _check_address_status(response.status_code, response.headers.get("Retry-After"))
+            if response.status_code == 200:
+                with suppress(ValueError):
+                    return _page_media(tiktok.scope_in_html(response.text), work["work_id"])
+            async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
+                navigation = await page.goto(work["url"], wait_until="domcontentloaded")
+                if navigation is not None:
+                    _check_address_status(navigation.status, navigation.headers.get("retry-after"))
+                candidates = _page_media(await page_data(page), work["work_id"])
+                self._pool.refreshed(identity, await session_of(page))
+                return candidates
         except LookupError as error:
-            outcome = "normal"
             raise Gone(str(error)) from error
         except ValueError as error:
-            outcome = "normal"
-            raise Retry(str(error), lease.line) from error
+            raise Stop(str(error)) from error
         except (OSError, BrowserError) as error:  # curl_cffi 的网络错误也是 OSError
-            detail = f"读作品页失败：{error}"
-            raise Retry(detail, lease.line) from error
-        except Retry as error:
-            detail = error.reason
-            raise
-        finally:
-            await self._scheduler.release(lease, outcome, detail, retry_after)
+            if _proxy_auth_failed(error):
+                raise Stop("读作品页时代理认证失败（407）", "auth_failed") from error
+            outcome = "suspect" if await proxy_reachable(lease.route) else "proxy_down"
+            raise Stop(f"读作品页失败：{type(error).__name__}", outcome) from error
 
     async def _fetch(
         self,
         lease: Lease,
         identity: Identity,
         referer: str,
-        candidates: list[str],
+        candidates: Sequence[str],
         path: Path,
         progress: DownloadProgress,
     ) -> str:
@@ -231,12 +281,12 @@ class Downloader:
             "Accept-Encoding": "identity",
         }
         proxy = await proxy_url(lease.route)
-        reason, outcome, transfers = "", "normal", 0
+        reason, outcome, transfers, skipped = "", "normal", 0, 0
         async with httpx.AsyncClient(
             proxy=proxy,
-            trust_env=proxy is not None,
+            trust_env=False,
             headers=headers,
-            timeout=httpx.Timeout(SLOW_WINDOW, connect=10),
+            timeout=httpx.Timeout(self._slow_window, connect=10),
             follow_redirects=True,
             max_redirects=3,
             event_hooks={"request": [trusted]},
@@ -247,21 +297,57 @@ class Downloader:
                         break
                     transfers += 1
                     try:
-                        return await transfer(client, url, path, progress, rate=self._rate)
+                        return await transfer(
+                            client,
+                            url,
+                            path,
+                            progress,
+                            rate=self._rate,
+                            slow_bytes=self._slow_bytes,
+                            slow_window=self._slow_window,
+                        )
                     except Skip as error:
                         reason = str(error)
+                        skipped += 1
                         break
                     except Broken as error:
                         reason, outcome = str(error), "suspect"
                     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as error:
-                        if "407" in str(error):
+                        if _proxy_auth_failed(error):
                             raise Stop("代理认证失败（407）", "auth_failed") from error
                         if not await proxy_reachable(lease.route):
-                            raise Stop(f"代理连不上：{error}", "proxy_down") from error
-                        reason, outcome = f"连不上视频服务器：{error}", "suspect"
+                            raise Stop("代理连不上", "proxy_down") from error
+                        reason, outcome = f"连不上视频服务器：{type(error).__name__}", "suspect"
                     except httpx.HTTPError as error:
-                        reason, outcome = f"传输出错：{error!r}", "suspect"
-        raise Stop(reason or "没有可用的媒体地址", outcome)
+                        reason, outcome = f"传输出错：{type(error).__name__}", "suspect"
+        raise Stop(reason or "没有可用的媒体地址", outcome, stale=skipped == len(candidates))
+
+
+def _page_media(data: dict | None, work_id: str) -> list[str]:
+    if data is None:
+        raise ValueError("作品页没有页面数据，可能停在了挑战页")
+    candidates = tiktok.media_of(data, work_id)
+    if not candidates:
+        raise ValueError("作品页里没有媒体地址")
+    return candidates
+
+
+def _check_address_status(status: int, retry_after: str | None) -> None:
+    if status == 407:
+        raise Stop("读作品页时代理认证失败（407）", "auth_failed")
+    if status == 429:
+        raise Stop("读作品页被限流（429）", "throttled", retry_after_seconds(retry_after))
+
+
+def _proxy_auth_failed(error: Exception) -> bool:
+    return re.search(r"\b407\b", str(error)) is not None
+
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        log.warning("无法清理下载文件 %s：%s", path, error)
 
 
 async def transfer(
@@ -271,6 +357,8 @@ async def transfer(
     progress: DownloadProgress | None = None,
     *,
     rate: DownloadRate | None = None,
+    slow_bytes: int = SLOW_BYTES,
+    slow_window: float = SLOW_WINDOW,
 ) -> str:
     """完整下载一次：只认 200 的视频响应，边写 .part 边算 SHA-256，核对长度后改名。"""
     part = path.with_suffix(".part")
@@ -281,7 +369,7 @@ async def transfer(
         async with client.stream("GET", url) as response:
             status = response.status_code
             if status in (401, 403):
-                raise Stop(f"视频服务器拒绝（{status}）", blocked=True)
+                raise Stop(f"视频服务器拒绝（{status}）", blocked=True, stale=status == 403)
             if status == 407:
                 raise Stop("代理认证失败（407）", "auth_failed")
             if status == 429:
@@ -301,10 +389,16 @@ async def transfer(
                 progress.total_bytes = total
             kind = response.headers.get("Content-Type", "").split(";")[0].strip()
             window, window_bytes = time.monotonic(), 0
+            head = bytearray()
+            video = _video(kind, head)
             with part.open("wb") as file:
-                async for chunk in response.aiter_raw(CHUNK):
-                    if not size and not _video(kind, chunk):
-                        raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
+                async for chunk in response.aiter_raw():
+                    if not video:
+                        head.extend(chunk[: 8 - len(head)])
+                        if len(head) == 8:
+                            video = _video(kind, head)
+                            if not video:
+                                raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
                     chunk_size = len(chunk)
                     size += chunk_size
                     if size > MAX_BYTES:
@@ -317,23 +411,25 @@ async def transfer(
                     if rate is not None:
                         rate.record(chunk_size, received_at)
                     window_bytes += chunk_size
-                    if (elapsed := received_at - window) >= SLOW_WINDOW:
-                        if window_bytes / elapsed < SLOW_BYTES:
+                    if (elapsed := received_at - window) >= slow_window:
+                        if window_bytes / elapsed < slow_bytes:
                             raise Broken("下载太慢")
                         window, window_bytes = received_at, 0
                 file.flush()
                 os.fsync(file.fileno())
         if not size or (total is not None and size != total):
             raise Broken(f"收到 {size} 字节，声明 {length or '未知'}")
+        if not video:
+            raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
         part.replace(path)
         return digest.hexdigest()
     except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ReadError) as error:
-        raise Broken(f"传输中途断开：{error!r}") from error
+        raise Broken(f"传输中途断开：{type(error).__name__}") from error
     finally:
-        part.unlink(missing_ok=True)
+        _remove_file(part)
 
 
-def _video(kind: str, head: bytes) -> bool:
+def _video(kind: str, head: bytes | bytearray) -> bool:
     """视频响应；通用二进制响应看文件头是不是 MP4。"""
     if kind.startswith("video/"):
         return True

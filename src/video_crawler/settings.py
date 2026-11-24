@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+SLOW_BYTES, SLOW_WINDOW = 20 * 1024, 45
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VC_", env_file=".env", extra="ignore")
@@ -21,9 +23,13 @@ class Settings(BaseSettings):
     public_url: str | None = None
     """调度中心访问本程序的地址，默认 http://<host>:<port>。"""
     data_dir: Path = Path("data")
-    """本地状态表和下载中的文件。"""
+    """下载中的本地文件。"""
     profile_root: Path = Path("profiles")
     """身份的浏览器资料目录。里面有 Cookie，按密码对待，不进仓库。"""
+    download_slow_bytes: int = Field(default=SLOW_BYTES, gt=0)
+    """下载断开阈值，单位是字节每秒。"""
+    download_slow_window: float = Field(default=SLOW_WINDOW, gt=0, allow_inf_nan=False)
+    """慢速下载的统计窗口和无数据读取超时，单位是秒。"""
     chrome_channel: str = "chrome"
     warm_headless: bool = True
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到

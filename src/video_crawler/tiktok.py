@@ -8,7 +8,9 @@
 
 import json
 import re
-from collections.abc import Iterator
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
@@ -28,9 +30,10 @@ _DATA = re.compile(rf'<script id="{DATA_ID}"[^>]*>(.*?)</script>', re.S)
 def scope(raw: str | None) -> dict | None:
     """页面数据里的 __DEFAULT_SCOPE__；没有或解析不了时返回 None，多半是停在了挑战页。"""
     try:
-        return json.loads(raw)["__DEFAULT_SCOPE__"]
+        data = json.loads(raw)["__DEFAULT_SCOPE__"]
     except (TypeError, ValueError, KeyError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def scope_in_html(html: str) -> dict | None:
@@ -73,19 +76,75 @@ def media_of(data: dict, work_id: str) -> list[str]:
 
     作品不存在时抛 LookupError，其他读不到的情况抛 ValueError。"""
     detail = data.get("webapp.video-detail") or {}
+    if not isinstance(detail, dict):
+        raise ValueError("作品页的详情格式无效")
     if detail.get("statusCode") == ITEM_GONE:
         raise LookupError("视频已删除或不存在")
-    item = (detail.get("itemInfo") or {}).get("itemStruct")
-    if not item or str(item.get("id")) != work_id:
+    info = detail.get("itemInfo")
+    item = info.get("itemStruct") if isinstance(info, dict) else None
+    if not isinstance(item, dict) or str(item.get("id")) != work_id:
         raise ValueError(
             f"作品页没有这条视频（{detail.get('statusCode')} {detail.get('statusMsg')}）"
         )
-    video = item.get("video") or {}
+    return media_candidates(item)
+
+
+def media_candidates(item: dict) -> list[str]:
+    """单条作品和列表共用同一套媒体字段，忽略缺失或无效的可选字段。"""
+    video = item.get("video")
+    if not isinstance(video, dict):
+        return []
     urls = [video.get("playAddr")]
-    for rate in video.get("bitrateInfo") or []:
-        urls += (rate.get("PlayAddr") or {}).get("UrlList") or []
+    rates = video.get("bitrateInfo")
+    if isinstance(rates, list):
+        for rate in rates:
+            if not isinstance(rate, dict):
+                continue
+            address = rate.get("PlayAddr") or rate.get("playAddr")
+            if isinstance(address, dict):
+                variants = address.get("UrlList") or address.get("urlList")
+                if isinstance(variants, list):
+                    urls.extend(variants)
     urls.append(video.get("downloadAddr"))
-    return list(dict.fromkeys(url for url in urls if url and url.startswith("https://")))[:3]
+    return list(
+        dict.fromkeys(url for url in urls if isinstance(url, str) and url.startswith("https://"))
+    )[:3]
+
+
+@dataclass(frozen=True)
+class MediaLinks:
+    identity_id: str
+    urls: tuple[str, ...]
+    cached_at: float
+
+
+class MediaCache:
+    """本进程短时复用列表里的媒体候选。只记录身份 ID，不存 Cookie。"""
+
+    def __init__(self, ttl: float = 8 * 60, limit: int = 2000) -> None:
+        self._ttl, self._limit = ttl, limit
+        self._entries: OrderedDict[str, MediaLinks] = OrderedDict()
+
+    def remember(self, identity_id: str, work_id: str, urls: list[str]) -> None:
+        now = time.monotonic()
+        self._entries[work_id] = MediaLinks(identity_id, tuple(urls), now)
+        self._entries.move_to_end(work_id)
+        self._prune(now)
+
+    def get(self, work_id: str) -> MediaLinks | None:
+        self._prune(time.monotonic())
+        return self._entries.get(work_id)
+
+    def discard(self, work_id: str, links: MediaLinks) -> None:
+        if self._entries.get(work_id) is links:
+            del self._entries[work_id]
+
+    def _prune(self, now: float) -> None:
+        while self._entries:
+            oldest = next(iter(self._entries.values()))
+            if len(self._entries) <= self._limit and now - oldest.cached_at < self._ttl:
+                break
+            self._entries.popitem(last=False)
 
 
 def request_cursor(url: str) -> str:
@@ -104,6 +163,7 @@ class Listing:
     ended: bool = False
     oldest: int | None = None
     """读到的最早的普通作品的发布时间（秒）。"""
+    on_media: Callable[[str, list[str]], None] | None = None
 
     def add(self, cursor: str, page: dict) -> bool:
         """加一页。请求游标接不上已读页的不收，保证从第一页起没有缺页；
@@ -123,10 +183,13 @@ class Listing:
         if more and (next_cursor is None or next_cursor == ""):
             raise ValueError("作品列表有下一页，但没有游标")
         for item in items:
-            self.items[str(item["id"])] = item
+            work_id = str(item["id"])
+            self.items[work_id] = item
             if not item.get("isPinnedItem"):
                 created = int(item["createTime"])
                 self.oldest = created if self.oldest is None else min(self.oldest, created)
+            if self.on_media and not item.get("imagePost") and (urls := media_candidates(item)):
+                self.on_media(work_id, urls)
         self.cursors.add(str(next_cursor))
         self.ended = self.ended or not more
         return True

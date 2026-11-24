@@ -8,7 +8,7 @@ class Wait(Exception):
         super().__init__(reason)
         self.seconds, self.reason = seconds, reason
         self.use = use
-        """在等哪个用途的线路；下载在等采集线路时，先不开始新的获取作品。"""
+        """在等哪个用途的线路（如果已知）。"""
 
 
 class Retry(Exception):

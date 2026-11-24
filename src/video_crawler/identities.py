@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 from collections import Counter, deque
@@ -16,13 +17,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from patchright.async_api import Error as BrowserError
+from redis.exceptions import RedisError
 
 from video_crawler import tiktok
 from video_crawler.browser import Browsers, Session, session_of
 from video_crawler.errors import Retry, Wait
 from video_crawler.scheduler import CRAWL, Scheduler
 from video_crawler.settings import Settings
-from video_crawler.store import Store
+from video_crawler.store import RETIRED_SHOWN, RETIRED_SINCE, IdentityStore
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +43,7 @@ RETIRE_FAILS = 6
 COOLDOWN, MAX_COOLDOWN = 60, 30 * 60
 RECENT = 3600
 """账号池页面的比率按最近一小时算。"""
-RETIRED_SINCE, RETIRED_SHOWN = 24 * 3600, 20
-"""快照只带最近 24 小时退休的，最多 20 个。"""
+IDENTITY_ID = re.compile(r"[0-9a-f]{12}")
 
 
 @dataclass
@@ -78,7 +79,7 @@ class Identity:
 
 class IdentityPool:
     def __init__(
-        self, settings: Settings, store: Store, scheduler: Scheduler, browsers: Browsers
+        self, settings: Settings, store: IdentityStore, scheduler: Scheduler, browsers: Browsers
     ) -> None:
         self._root = settings.profile_root
         self._store, self._scheduler, self._browsers = store, scheduler, browsers
@@ -96,11 +97,51 @@ class IdentityPool:
         self._recent: deque[tuple[float, str, bool]] = deque()
         self._short_since: float | None = None
         """可用身份从什么时候开始少于目标，每次心跳取快照时更新。"""
-        for record in store.identities():
+        self._dirty: dict[str, dict] = {}
+        self._retired: deque[Identity] = deque(maxlen=RETIRED_SHOWN)
+
+    async def restore(self) -> None:
+        """加载本机元数据并重新预热已有的 Chrome 资料目录。"""
+        known = set()
+        for record in await asyncio.to_thread(self._store.records):
+            if not IDENTITY_ID.fullmatch(record["id"]):
+                continue
             identity = Identity(**record)
+            known.add(identity.id)
+            if identity.retired_at is not None:
+                self._retired.append(identity)
+                continue
             self.identities[identity.id] = identity
+        for identity in list(self.identities.values()):
             if not self.profile(identity).is_dir():
                 self.retire(identity, "资料目录不见了")
+        if self._root.is_dir():
+            for path in self._root.iterdir():
+                if path.name not in known and IDENTITY_ID.fullmatch(path.name) and path.is_dir():
+                    self.identities[path.name] = Identity(path.name)
+
+    async def persist(self) -> None:
+        pending = self._dirty.copy()
+        if not pending:
+            return
+        write = asyncio.create_task(asyncio.to_thread(self._store.save, pending.values()))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            # 退出会再刷一次最新状态，先等旧的 Redis 写入完成。
+            await asyncio.gather(write, return_exceptions=True)
+            raise
+        for key, record in pending.items():
+            if self._dirty.get(key) is record:
+                del self._dirty[key]
+
+    async def persist_loop(self) -> None:
+        while True:
+            try:
+                await self.persist()
+            except RedisError as error:
+                log.warning("身份元数据写入 Redis 失败，稍后重试：%s", error)
+            await asyncio.sleep(1)
 
     def profile(self, identity: Identity) -> Path:
         return self._root / identity.id
@@ -132,8 +173,9 @@ class IdentityPool:
         shown.extend(
             identity for key, identity in self._warming.items() if key not in self.identities
         )
-        retired = self._store.retired(now - RETIRED_SINCE, RETIRED_SHOWN)
-        shown += [Identity(**record) for record in retired]
+        shown += [
+            item for item in reversed(self._retired) if item.retired_at >= now - RETIRED_SINCE
+        ]
         return {
             **summary,
             "short_since": self._short_since,
@@ -179,17 +221,22 @@ class IdentityPool:
             and identity.fresh(now)
         )
 
-    def take(self) -> Identity:
-        """挑一个能用的身份：连续失败少的优先，再挑最久没用的。挑不到就等补上。"""
+    def available(self) -> list[Identity]:
         now = time.time()
-        ready = [
+        return [
             identity
             for identity in self.identities.values()
             if not identity.busy and self._usable_session(identity, now)
         ]
+
+    def take(self, *, preferred_id: str | None = None) -> Identity:
+        """优先用指定的空闲身份，其次按连续失败次数和上次使用时间排序。"""
+        ready = self.available()
         if not ready:
             raise Wait(10, "没有可用身份")
-        identity = min(ready, key=lambda item: (item.fails, item.last_used_at))
+        identity = min(
+            ready, key=lambda item: (item.id != preferred_id, item.fails, item.last_used_at)
+        )
         identity.busy = True
         return identity
 
@@ -206,7 +253,7 @@ class IdentityPool:
             identity.session = None
             if identity.fails >= RETIRE_FAILS:
                 return self.retire(identity, f"下载连续 {identity.fails} 次被拒")
-        self._store.save_identity(identity.record())
+        self._dirty[identity.id] = identity.record()
         if not identity.fresh(now, REFRESH_AFTER):
             self._wake.set()
 
@@ -347,7 +394,7 @@ class IdentityPool:
         log.info("身份 %s 预热好了", identity.id)
         self.browser = identity.browser = session.browser
         self.refreshed(identity, session)
-        self._store.save_identity(identity.record())
+        self._dirty[identity.id] = identity.record()
         self.identities[identity.id] = identity
         for other in list(self.identities.values()):
             if other.browser != self.browser and not other.busy:
@@ -359,6 +406,7 @@ class IdentityPool:
         identity.retired_at, identity.retire_reason = time.time(), reason
         self.identities.pop(identity.id, None)
         shutil.rmtree(self.profile(identity), ignore_errors=True)
-        self._store.save_identity(identity.record())
+        self._dirty[identity.id] = identity.record()
+        self._retired.append(identity)
         log.info("身份 %s 退休：%s", identity.id, reason)
         self._wake.set()

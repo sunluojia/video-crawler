@@ -1,20 +1,18 @@
 # 爬取程序
 
-接收[调度中心](https://github.com/sunluojia/video-scheduler-center)的任务，获取 TikTok 达人资料和最新五条作品（`crawl_creator`），下载一条视频并上传给调度中心（`download_video`）。实现细节见[爬取方案](https://github.com/sunluojia/video-scheduler-center/blob/main/docs/crawler-design.md)和[单视频下载方案](https://github.com/sunluojia/video-scheduler-center/blob/main/docs/video-download-design.md)，接口约定见[调度中心设计文档第 4 节](https://github.com/sunluojia/video-scheduler-center/blob/main/docs/design.md#4-与爬取程序的约定)。
+向[调度中心](https://github.com/sunluojia/video-scheduler-center)认领任务，获取 TikTok 达人资料和最新五条作品（`crawl_creator`），或下载视频并上传（`download_video`）。
 
 ## 怎么工作
 
-- **身份池**：每个身份是一个本机 Chrome 的浏览器资料目录，用它打开 TikTok 首页预热出 Cookie 和 `tt_chain_token`。在调度中心的「账号池」设置可用身份目标（默认 8 个，多台设备平均分摊），在「执行程序」按设备设置同时预热的数量（默认 1 个）。这两项随心跳下发。后台自动补充身份，满 25 分钟刷新，下载连续被拒 6 次就换掉。重启后按已有资料目录重新预热。
-- **获取作品**：挑一个身份，向调度中心要一条“获取信息”线路，用身份的浏览器打开达人主页，读页面数据里的资料，抓页面自己加载的作品列表，选出截止时间前的前五条（图文和视频一起数）。
-- **下载**：要一条“下载视频”线路；挑一个身份，经采集线路带它的 Cookie 读作品页拿到媒体地址；再带这个身份的 `tt_chain_token` 经下载线路下载，校验完整后上传。
-- **失败**：这次没做成就 1 分钟、5 分钟后换线路再试，3 次都没成回传原因；申请不到线路、没有可用身份、磁盘满这类环境问题只是等着，不算次数。
-- **线路**：都向调度中心申请，用完归还并报告表现。浏览器不能直接用带口令的代理，程序会在本机开一个无口令的转发口给它，浏览器关了就关掉。暂不支持 SSH 类型的代理。
-
-一个进程里跑：收任务的 Dramatiq 线程（只记进本地状态表）、任务队列、身份池、事件投递、心跳和控制接口。
+- **认领与续租**　一个进程使用稳定的 `VC_INSTANCE_ID` 和本次启动生成的会话 UUID，按空闲身份与槽位向调度中心认领 PostgreSQL 中的任务。只剩一个空闲身份时轮转采集与下载。每 15 秒报告在途尝试和线路。收到撤销时停止对应尝试。
+- **采集线路**　`crawler.crawl_creator` 用于预热身份、读取达人资料和作品列表，以及下载前为单条作品取媒体地址。取链先用 HTTP，遇到挑战页或缺少作品数据时用同一身份和线路打开 Chrome。拿到地址后立即归还采集租约。
+- **下载线路**　`crawler.download_video` 用于拉取 MP4。拉流使用同一身份的 UA、Referer 和 `tt_chain_token`。从作品列表取到的直链只保留在本进程内存，最多 2,000 条，8 分钟有效。同身份空闲时可直接试下载；收到 403 或所有缓存候选不可用时清掉旧条目再取链。每个线路分别回报结果，文件校验后携带尝试和会话归属上传。
+- **重试与结果**　线路、身份、磁盘、限流或代理 407 等环境等待会退回调度中心，不扣业务次数。业务失败按约 1 分钟、5 分钟退避，最多尝试三次。结果投递到 Redis `crawler.events`。入队前遇到 Redis 暂时不可用，进程会续租并用同一个事件 ID 重投。进程在入队前退出时，调度中心可在租约过期后重派任务。
+- **身份与文件**　身份元数据按设备保存在 Redis。Cookie 由本机 Chrome 资料目录管理，媒体直链和会话 Cookie 不发送到 Redis。下载临时文件按尝试隔离。
 
 ## 运行
 
-需要 [uv](https://docs.astral.sh/uv/)、本机安装的 Chrome，以及调度中心的 Redis。**身份预热默认用无头 Chrome**（`VC_WARM_HEADLESS=1`），只拿 Cookie 那一步不开界面；**采集作品仍然要有界面**，Linux 上需要虚拟显示（例如 Xvfb）。
+需要 [uv](https://docs.astral.sh/uv/)、本机 Chrome、支持任务认领协议的调度中心，以及调度中心的 Redis。身份预热默认用无头 Chrome（`VC_WARM_HEADLESS=1`）。采集和作品页的 Chrome 回退需要图形环境，Linux 可用 Xvfb。
 
 ```bash
 cp .env.example .env
@@ -30,9 +28,11 @@ uv sync
 uv run video-crawler
 ```
 
-启动后向调度中心注册，心跳带上身份池的快照（不含 Cookie），调度中心“账号池”页面据此显示。同时获取几个达人（开几个 Chrome 窗口，默认 2）、同时下载几条（默认 4）在调度中心“执行程序”页设置，随心跳回复下发，改了不用重启。在 8091 端口提供控制接口（暂停采集、恢复采集、取消批次，刷新和退休身份，`/api/status`，代为测试和测速代理）；暂停采集只拦住新的达人采集，下载照常。获取作品要能访问 TikTok 的采集线路，请在调度中心“代理”页给“获取信息”配好美国住宅代理，或者给这台设备设本机端口例外。不要和模拟爬取程序同时连同一个调度中心，否则任务会被两边分走。
+在调度中心的「代理」为采集用途配置美国住宅线路，为下载用途配置香港直连。采集、下载、预热并发由「执行程序」设置，身份目标由「账号池」设置，调整随心跳生效。下载低速断开条件默认是 45 秒内平均低于 20 KiB/s，可用 `VC_DOWNLOAD_SLOW_BYTES`（字节/秒）和 `VC_DOWNLOAD_SLOW_WINDOW`（秒）调整。
 
-`data/` 里是本地状态表和下载中的文件，`profiles/` 里是身份的浏览器资料目录，都不要放进仓库，`profiles/` 等同密码。
+控制接口默认监听 8091，使用服务凭据鉴权。`/api/health` 检查进程存活，`/api/status` 显示执行状态，`/api/progress` 合并采集与下载进度。`/api/batches/{id}/pause` 停止该批次的在途采集并归还尝试，下载继续执行。`resume` 恢复采集，`cancel` 停止该批次的所有在途尝试。身份操作和代理测试接口继续提供。
+
+`data/` 保存下载中的文件，`profiles/` 保存本机 Chrome 资料。两个目录均在 Git 忽略列表内。
 
 ## 测试
 

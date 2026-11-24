@@ -160,6 +160,28 @@ def test_missing_or_other_videos():
         tiktok.media_of(video_scope(work_id="8", playAddr="https://x.tiktokcdn.com/a"), "7")
 
 
+def test_media_cache_expires_is_bounded_and_preserves_a_newer_result(monkeypatch):
+    now = 0
+    monkeypatch.setattr(tiktok.time, "monotonic", lambda: now)
+    cache = tiktok.MediaCache(ttl=480, limit=2)
+    urls = ["https://v16.tiktokcdn.com/a"]
+    cache.remember("identity-1", "old", urls)
+    cache.remember("identity-1", "work", urls)
+    previous = cache.get("work")
+    now = 30
+    cache.remember("identity-2", "work", urls)
+    cache.discard("work", previous)
+    cache.remember("identity-2", "another", urls)
+    urls.append("https://v16.tiktokcdn.com/b")
+    assert cache.get("old") is None
+    assert cache.get("work").identity_id == "identity-2"
+    assert cache.get("work").urls == tuple(urls[:1])
+    now = 509
+    assert cache.get("work") is not None
+    now = 510
+    assert cache.get("work") is None and cache.get("another") is None
+
+
 def test_page_data_in_html_and_challenge_pages():
     html = '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
     html += '{"__DEFAULT_SCOPE__": {"webapp.app-context": {}}}</script>'

@@ -703,6 +703,7 @@ dependencies = [
     { name = "httpx", extra = ["socks"] },
     { name = "patchright" },
     { name = "pydantic-settings" },
+    { name = "redis" },
     { name = "uvicorn" },
 ]
 
@@ -723,6 +724,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.16.3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.2" },
+    { name = "redis", specifier = ">=5" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.17" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]

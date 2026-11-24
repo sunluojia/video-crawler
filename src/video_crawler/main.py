@@ -1,112 +1,110 @@
-"""启动爬取程序：一个进程、一个事件循环。
-
-- Dramatiq 线程只收任务：记进本地状态表并排好 accepted 事件，然后唤醒任务队列。
-- 事件循环里跑任务队列、身份池的后台循环、待发事件的投递、心跳和控制接口。
-"""
+"""在同一事件循环里认领任务、维护身份、投递结果并处理心跳和控制请求。"""
 
 import asyncio
 import contextlib
 import logging
+from functools import partial
 from importlib.metadata import version
 
-import dramatiq
 import httpx
 import uvicorn
 from dramatiq import Message
 from dramatiq.brokers.redis import RedisBroker
+from redis import Redis
+from redis.exceptions import RedisError
 
+from video_crawler import tiktok
 from video_crawler.api import control_api
 from video_crawler.browser import Browsers
 from video_crawler.crawl import Crawler
 from video_crawler.download import Downloader
 from video_crawler.identities import IdentityPool
-from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner, event
+from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import Scheduler
 from video_crawler.settings import Settings
-from video_crawler.store import Store
+from video_crawler.store import IdentityStore
 
 log = logging.getLogger("video_crawler")
 
-TASKS, EVENTS, EVENT_ACTOR = "crawler.tasks", "crawler.events", "crawler_event"
+EVENTS, EVENT_ACTOR = "crawler.events", "crawler_event"
 VERSION = version("video-crawler")
 
 
+async def heartbeat(
+    scheduler: Scheduler, url: str, runner: Runner, pool: IdentityPool, browsers: Browsers
+) -> None:
+    while True:
+        try:
+            reply = await scheduler.register(url, VERSION, pool.snapshot(), runner.attempt_ids())
+            runner.revoke(reply.get("revoked_attempts", []))
+            slots = {
+                CRAWL_CREATOR: reply["crawl_slots"],
+                DOWNLOAD_VIDEO: reply["download_slots"],
+            }
+            warm_slots = reply.get("warm_slots") or 1
+            if slots != runner.slots or warm_slots != pool.warm_slots:
+                log.info(
+                    "并发：同时获取作品 %s 个，同时下载 %s 个，同时预热 %s 个",
+                    slots[CRAWL_CREATOR],
+                    slots[DOWNLOAD_VIDEO],
+                    warm_slots,
+                )
+                await browsers.resize(slots[CRAWL_CREATOR] + warm_slots)
+                runner.slots.update(slots)
+                runner.wake()
+            pool.configure(reply["identity_target"] or 0, warm_slots)
+        except httpx.HTTPError as error:
+            log.warning("注册失败，稍后重试：%s", error)
+        await asyncio.sleep(15)
+
+
 async def serve(settings: Settings) -> None:
-    store = Store(settings.data_dir / "state.db")
+    with Redis.from_url(settings.redis_url, socket_connect_timeout=3, socket_timeout=3) as redis:
+        await _serve(settings, redis)
+
+
+async def publish_event(broker: RedisBroker, item: dict) -> None:
+    message = Message(EVENTS, EVENT_ACTOR, (item,), {}, {})
+    await asyncio.to_thread(broker.enqueue, message)
+
+
+async def _serve(settings: Settings, redis: Redis) -> None:
+    store = IdentityStore(redis, settings.instance_id)
     scheduler = Scheduler(settings)
     browsers = Browsers(settings.chrome_channel, warm_headless=settings.warm_headless)
     pool = IdentityPool(settings, store, scheduler, browsers)
-    crawler = Crawler(pool, scheduler, browsers)
-    downloader = Downloader(pool, scheduler, browsers, settings.data_dir / "videos")
+    await pool.restore()
+    media_cache = tiktok.MediaCache()
+    crawler = Crawler(pool, scheduler, browsers, media_cache=media_cache)
+    downloader = Downloader(
+        pool,
+        scheduler,
+        browsers,
+        settings.data_dir / "videos",
+        media_cache=media_cache,
+        slow_bytes=settings.download_slow_bytes,
+        slow_window=settings.download_slow_window,
+    )
+    broker = RedisBroker(client=redis)
+    broker.declare_queue(EVENTS)
     runner = Runner(
-        store,
+        scheduler,
         {
             CRAWL_CREATOR: crawler,
             DOWNLOAD_VIDEO: downloader,
         },
         {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0},  # 第一次心跳拿到并发数之前不开始
+        available_identities=lambda: len(pool.available()),
+        publish=partial(publish_event, broker),
     )
-    broker = RedisBroker(url=settings.redis_url)
-    broker.declare_queue(EVENTS)  # 事件发给调度中心，本程序只消费任务队列
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(ignore_resets)
-
-    def receiver(kind: str):
-        def receive(body: dict) -> None:
-            accepted = event(body["task_id"], body["run"], "accepted")
-            if store.receive(kind, body, accepted):
-                loop.call_soon_threadsafe(runner.wake)
-
-        return receive
-
-    for kind in (CRAWL_CREATOR, DOWNLOAD_VIDEO):
-        dramatiq.actor(receiver(kind), broker=broker, actor_name=kind, queue_name=TASKS)
-    worker = dramatiq.Worker(broker, queues={TASKS}, worker_threads=2)
-
-    async def deliver() -> None:
-        """投递待发事件；Redis 暂时不通就下次再投，事件 ID 不变，调度中心按它去重。"""
-        while True:
-            for item in store.events():
-                try:
-                    message = Message(EVENTS, EVENT_ACTOR, (item,), {}, {})
-                    await asyncio.to_thread(broker.enqueue, message)
-                except Exception as error:
-                    log.warning("投递事件失败，稍后重试：%s", error)
-                    break
-                store.sent(item["event_id"])
-            await asyncio.sleep(1)
-
-    async def heartbeat() -> None:
-        """注册兼心跳；回复里是页面上设置的身份数和并发，改了不用重启。"""
-        while True:
-            try:
-                reply = await scheduler.register(settings.url, VERSION, pool.snapshot())
-                slots = {
-                    CRAWL_CREATOR: reply["crawl_slots"],
-                    DOWNLOAD_VIDEO: reply["download_slots"],
-                }
-                warm_slots = reply.get("warm_slots") or 1
-                if slots != runner.slots or warm_slots != pool.warm_slots:
-                    log.info(
-                        "并发：同时获取作品 %s 个，同时下载 %s 个，同时预热 %s 个",
-                        slots[CRAWL_CREATOR],
-                        slots[DOWNLOAD_VIDEO],
-                        warm_slots,
-                    )
-                    await browsers.resize(slots[CRAWL_CREATOR] + warm_slots)
-                    runner.slots.update(slots)
-                    runner.wake()
-                pool.configure(reply["identity_target"] or 0, warm_slots)
-            except httpx.HTTPError as error:
-                log.warning("注册失败，稍后重试：%s", error)
-            await asyncio.sleep(15)
 
     token = settings.service_token.get_secret_value()
     server = uvicorn.Server(
         uvicorn.Config(
             control_api(
                 token,
-                store,
                 runner,
                 pool,
                 scheduler,
@@ -119,9 +117,11 @@ async def serve(settings: Settings) -> None:
         )
     )
     await browsers.start()
-    worker.start()
     background = [
-        asyncio.create_task(job) for job in (runner.run(), pool.run(), deliver(), heartbeat())
+        asyncio.create_task(runner.run()),
+        asyncio.create_task(pool.run()),
+        asyncio.create_task(pool.persist_loop()),
+        asyncio.create_task(heartbeat(scheduler, settings.url, runner, pool, browsers)),
     ]
 
     def stopped(job: asyncio.Task) -> None:
@@ -135,12 +135,14 @@ async def serve(settings: Settings) -> None:
     try:
         await server.serve()
     finally:
-        # 进行中的尝试直接中止：归还线路、清掉半截文件，任务留在本地状态表里，下次启动接着做
-        worker.stop()
-        jobs = background + [job for _, job in runner.running.values()]
-        for job in jobs:
+        # 停止续租，调度中心回收未完成的尝试，已入队的事件继续由 Redis 投递。
+        for job in background:
             job.cancel()
-        await asyncio.gather(*jobs, return_exceptions=True)
+        await asyncio.gather(*background, *runner.stop(), return_exceptions=True)
+        try:
+            await pool.persist()
+        except RedisError as error:
+            log.warning("退出时身份元数据写入 Redis 失败：%s", error)
         await browsers.stop()
         with contextlib.suppress(httpx.HTTPError):
             await scheduler.withdraw()

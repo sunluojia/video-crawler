@@ -175,9 +175,41 @@ async def test_a_complete_video_is_saved_with_its_sha256(tmp_path):
     assert not path.with_suffix(".part").exists()
 
 
+@pytest.mark.parametrize(
+    ("rate", "minimum", "accepted"), [(60, 20, True), (10, 20, False), (10, 8, True)]
+)
+async def test_slow_download_window_uses_actual_chunks(
+    tmp_path, monkeypatch, rate, minimum, accepted
+):
+    now = 0.0
+    monkeypatch.setattr(download, "time", SimpleNamespace(monotonic=lambda: now))
+    body = MP4.ljust(rate * 1024 * 9, b"x")
+
+    async def chunks():
+        yield body[:4]
+        for step in range(5):
+            nonlocal now
+            now += 9
+            yield body[4:] if step == 0 else body
+
+    response = httpx.Response(200, content=chunks(), headers={"Content-Length": str(len(body) * 5)})
+    path = tmp_path / "download.mp4"
+    async with media_client(response) as client:
+        transfer = download.transfer(
+            client, "https://v16.tiktokcdn.com/a", path, slow_bytes=minimum * 1024
+        )
+        if accepted:
+            assert await transfer == hashlib.sha256(body * 5).hexdigest()
+        else:
+            with pytest.raises(Broken, match="下载太慢"):
+                await transfer
+    assert path.exists() is accepted
+    assert not path.with_suffix(".part").exists()
+
+
 @pytest.mark.parametrize("known_size", [True, False])
 async def test_transfer_reports_bytes_during_each_attempt(tmp_path, known_size, monkeypatch):
-    first = MP4.ljust(download.CHUNK, b"x")
+    first = MP4.ljust(256 * 1024, b"x")
     last = b"remaining"
     total = len(first) + len(last) if known_size else None
     progress = download.DownloadProgress("task", "video", received_bytes=123, total_bytes=456)
@@ -250,6 +282,7 @@ async def test_a_403_marks_the_token_as_refused(tmp_path):
             media_client(streamed(403)), "https://v16.tiktokcdn.com/a", tmp_path / "v.mp4"
         )
     assert stop.value.blocked
+    assert stop.value.stale
     assert stop.value.outcome == "suspect"
 
 

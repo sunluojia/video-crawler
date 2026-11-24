@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from functools import partial
 from math import ceil
 from typing import Literal
 
@@ -21,8 +22,7 @@ from video_crawler.browser import Browsers, page_data, session_of
 from video_crawler.errors import Retry, Wait
 from video_crawler.identities import IdentityPool
 from video_crawler.routes import proxy_reachable
-from video_crawler.scheduler import CRAWL, MAX_RETRY_AFTER, ListingResult, Scheduler
-from video_crawler.store import Task
+from video_crawler.scheduler import CRAWL, MAX_RETRY_AFTER, ClaimedTask, ListingResult, Scheduler
 
 LIST_SECONDS = 30
 MAX_PAGES = 10
@@ -61,28 +61,38 @@ type ListingPage = tuple[str, bytes] | ListingFailure | _CrawlWait
 
 
 class Crawler:
-    def __init__(self, pool: IdentityPool, scheduler: Scheduler, browsers: Browsers) -> None:
+    def __init__(
+        self,
+        pool: IdentityPool,
+        scheduler: Scheduler,
+        browsers: Browsers,
+        *,
+        media_cache: tiktok.MediaCache | None = None,
+    ) -> None:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
+        self._media = media_cache or tiktok.MediaCache()
         self._active: dict[str, CrawlProgress] = {}
 
     def progress(self) -> list[CrawlProgress]:
         return list(self._active.values())
 
-    async def __call__(self, task: Task) -> dict:
+    async def __call__(self, task: ClaimedTask) -> dict:
         """一次尝试，返回 crawled 事件的内容。"""
         progress = CrawlProgress(
             task.task_id, task.body["creator"]["handle"], task.body["max_works"]
         )
-        self._active[task.task_id] = progress
+        self._active[task.attempt_id] = progress
         try:
             return await self._collect(task, progress)
         finally:
-            self._active.pop(task.task_id, None)
+            self._active.pop(task.attempt_id, None)
 
-    async def _collect(self, task: Task, progress: CrawlProgress) -> dict:
+    async def _collect(self, task: ClaimedTask, progress: CrawlProgress) -> dict:
         identity = self._pool.take()
         try:
-            lease = await self._scheduler.lease(CRAWL, task.task_id, task.avoid)
+            lease = await self._scheduler.lease(
+                CRAWL, task.task_id, task.avoid, attempt_id=task.attempt_id
+            )
         except BaseException:
             self._pool.give_back(identity)
             raise
@@ -92,7 +102,14 @@ class Crawler:
         retry_after = None
         try:
             async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
-                result = await _read(page, task.body, lease.line, self._pool.note, progress)
+                result = await _read(
+                    page,
+                    task.body,
+                    lease.line,
+                    self._pool.note,
+                    progress,
+                    on_media=partial(self._media.remember, identity.id),
+                )
                 session = await session_of(page)
             outcome = "normal"
             if result["conclusion"] == "ok":
@@ -100,6 +117,9 @@ class Crawler:
                 if not result["works"]:
                     detail = "作品列表完整，无符合条件的作品"
             return result
+        except asyncio.CancelledError:
+            outcome = "normal"
+            raise
         except _CrawlWait as wait:
             outcome, detail = wait.outcome, wait.reason
             if outcome == "throttled":
@@ -126,11 +146,18 @@ class Crawler:
             finally:
                 if session:
                     self._pool.refreshed(identity, session)
-                self._pool.give_back(identity, "ok" if outcome == "normal" else "neutral")
+                result = "ok" if session and outcome == "normal" else "neutral"
+                self._pool.give_back(identity, result)
 
 
 async def _read(
-    page: Page, body: dict, line: str, note: Callable[[str, bool], None], progress: CrawlProgress
+    page: Page,
+    body: dict,
+    line: str,
+    note: Callable[[str, bool], None],
+    progress: CrawlProgress,
+    *,
+    on_media: Callable[[str, list[str]], None] | None = None,
 ) -> dict:
     pages: asyncio.Queue[ListingPage] = asyncio.Queue()
 
@@ -165,7 +192,9 @@ async def _read(
     if conclusion:
         return {"conclusion": conclusion, "profile": profile}
 
-    listing = tiktok.Listing(datetime.fromisoformat(body["cutoff"]), progress.max_works)
+    listing = tiktok.Listing(
+        datetime.fromisoformat(body["cutoff"]), progress.max_works, on_media=on_media
+    )
     try:
         works = await _read_listing(page, pages, listing, line, progress)
     except ListingFailure as failure:

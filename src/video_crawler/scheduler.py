@@ -1,16 +1,17 @@
-"""调度中心的接口：申请和归还线路、上传视频、注册心跳。约定见调度中心设计文档第 4 节和代理方案。"""
+"""向调度中心认领任务、申请线路、上传视频和续租。"""
 
 import logging
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Collection, Sequence
+from dataclasses import dataclass, field
+from math import ceil
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import httpx
 
 from video_crawler.errors import Wait
 from video_crawler.settings import Settings
-from video_crawler.store import Task
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,24 @@ CRAWL, DOWNLOAD = "crawler.crawl_creator", "crawler.download_video"
 USE_NAMES = {CRAWL: "采集", DOWNLOAD: "下载"}
 type ListingResult = Literal["complete", "empty_response", "read_failed"]
 MAX_RETRY_AFTER = 2_147_483_647
+
+
+@dataclass(frozen=True)
+class ClaimedTask:
+    task_id: str
+    run: int
+    kind: str
+    attempt_id: str
+    body: dict
+    attempts: int = 0
+    avoid: list[str] = field(default_factory=list)
+    history: list[str] = field(default_factory=list)
+    attempt_no: int = 1
+    lease_expires_at: str | None = None
+
+    @property
+    def batch_id(self) -> str:
+        return self.body["batch_id"]
 
 
 @dataclass
@@ -33,17 +52,54 @@ class Lease:
 class Scheduler:
     def __init__(self, settings: Settings) -> None:
         self.instance = settings.instance_id
+        self.session_id = uuid4()
         self._http = httpx.AsyncClient(
             base_url=settings.scheduler_url,
             headers={"Authorization": f"Bearer {settings.service_token.get_secret_value()}"},
+            trust_env=False,
             timeout=60,
         )
         self.leases: set[str] = set()
         """正在用的线路，随心跳续期。"""
 
-    async def lease(self, use: str, task_id: str | None = None, avoid: list[str] = ()) -> Lease:
+    async def claim(self, kinds: dict[str, int]) -> list[ClaimedTask]:
+        body = {"executor_id": self.instance, "executor_session_id": str(self.session_id)}
+        response = await self._http.post("/api/crawler-tasks/claim", json={**body, "kinds": kinds})
+        return [ClaimedTask(**task) for task in response.raise_for_status().json()["tasks"]]
+
+    async def defer(
+        self,
+        attempt_id: str,
+        retry_after: float,
+        reason: str,
+        consume_attempt: bool = False,
+        avoid_line: str | None = None,
+    ) -> None:
+        body = {
+            "executor_id": self.instance,
+            "executor_session_id": str(self.session_id),
+            "retry_after": min(max(ceil(retry_after), 0), MAX_RETRY_AFTER),
+            "reason": reason,
+            "consume_attempt": consume_attempt,
+            "avoid_line": avoid_line,
+        }
+        response = await self._http.post(
+            f"/api/crawler-tasks/attempts/{attempt_id}/defer", json=body, timeout=10
+        )
+        response.raise_for_status()
+
+    async def lease(
+        self,
+        use: str,
+        task_id: str | None = None,
+        avoid: Sequence[str] = (),
+        *,
+        attempt_id: str | None = None,
+    ) -> Lease:
         """申请一条线路；分不到时抛 Wait，按调度中心给的时间再来。"""
         body = {"device": self.instance, "use": use, "task_id": task_id, "avoid": list(avoid)}
+        if attempt_id is not None:
+            body["attempt_id"] = attempt_id
         try:
             response = await self._http.post("/api/proxy-leases", json=body)
             reply = response.raise_for_status().json()
@@ -76,7 +132,7 @@ class Scheduler:
         except httpx.HTTPError as error:
             log.warning("归还线路失败，调度中心 60 秒后自动收回：%s", error)
 
-    async def upload(self, task: Task, path: Path, sha256: str) -> int:
+    async def upload(self, task: ClaimedTask, path: Path, sha256: str) -> int:
         """上传一条视频，返回状态码：204 已登记，404、409 不要了，422 内容对不上。"""
 
         async def chunks() -> AsyncIterator[bytes]:
@@ -87,23 +143,34 @@ class Scheduler:
         response = await self._http.put(
             f"/api/download-tasks/{task.task_id}/runs/{task.run}/video",
             content=chunks(),
-            headers={"Content-Length": str(path.stat().st_size), "X-Content-SHA256": sha256},
+            headers={
+                "Content-Length": str(path.stat().st_size),
+                "X-Content-SHA256": sha256,
+                "X-Attempt-ID": task.attempt_id,
+                "X-Executor-ID": self.instance,
+                "X-Executor-Session-ID": str(self.session_id),
+            },
             timeout=600,
         )
         return response.status_code
 
-    async def register(self, url: str, version: str, identities: dict) -> dict:
-        """注册兼心跳，同时为正在用的线路续期，并带上身份池的快照。
-        返回调度中心的回复：分给本机的可用身份数、获取作品和下载的并发数。"""
+    async def register(
+        self, url: str, version: str, identities: dict, task_attempts: Collection[str] = ()
+    ) -> dict:
+        """续租正在用的线路和任务，返回撤销的尝试及本机并发设置。"""
         body = {
             "url": url,
             "version": version,
             "leases": sorted(self.leases),
             "identities": identities,
+            "executor_session_id": str(self.session_id),
+            "task_attempts": sorted(task_attempts),
         }
         response = await self._http.put(f"/api/crawler-services/{self.instance}", json=body)
         return response.raise_for_status().json()
 
     async def withdraw(self) -> None:
-        await self._http.delete(f"/api/crawler-services/{self.instance}")
-        await self._http.aclose()
+        try:
+            await self._http.delete(f"/api/crawler-services/{self.instance}")
+        finally:
+            await self._http.aclose()

@@ -10,26 +10,26 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from video_crawler import crawl
+from video_crawler import crawl, tiktok
 from video_crawler.api import control_api
 from video_crawler.browser import Session
 from video_crawler.errors import Retry, Wait
 from video_crawler.identities import Identity
 from video_crawler.runner import Runner
-from video_crawler.scheduler import CRAWL, Lease
-from video_crawler.store import Store, Task
+from video_crawler.scheduler import CRAWL, ClaimedTask, Lease
 
 
 async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_responses(
     tmp_path, monkeypatch
 ):
     cutoff = 1_730_000_000
-    task = Task(
+    task = ClaimedTask(
         str(uuid4()),
         1,
         "crawl_creator",
         str(uuid4()),
         {
+            "batch_id": str(uuid4()),
             "creator": {"handle": "alice"},
             "cutoff": datetime.fromtimestamp(cutoff, UTC).isoformat(),
             "max_works": 5,
@@ -73,9 +73,13 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
             )
         )
 
+    media_url = "https://v16.tiktokcdn.com/a?signature=test"
+
     async def goto(*args, **kwargs):
         # 首屏作品页可能先于达人资料到达。
-        await respond("0", "1", [item("7", -1), item("8", 1)], more=True)
+        await respond(
+            "0", "1", [item("7", -1, video={"playAddr": media_url}), item("8", 1)], more=True
+        )
         profile_opened.set()
         await finish_profile.wait()
 
@@ -93,10 +97,11 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
         yield page
 
     browsers = SimpleNamespace(open=Mock(side_effect=open_browser))
-    crawler = crawl.Crawler(pool, scheduler, browsers)
-    store = Store(tmp_path / "state.db")
+    media_cache = tiktok.MediaCache()
+    crawler = crawl.Crawler(pool, scheduler, browsers, media_cache=media_cache)
     token = "t" * 16
-    app = control_api(token, store, Runner(store, {}, {}), pool, scheduler, crawls=crawler.progress)
+    runner = Runner(scheduler, {}, {}, available_identities=lambda: 0, publish=AsyncMock())
+    app = control_api(token, runner, pool, scheduler, crawls=crawler.progress)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app),
         base_url="http://crawler",
@@ -128,13 +133,19 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
             result = await asyncio.wait_for(job, 1)
             assert result["conclusion"] == "ok"
             assert [work["work_id"] for work in result["works"]] == ["7", "6"]
+            cached = media_cache.get("7")
+            assert cached is not None and (cached.identity_id, cached.urls) == (
+                identity.id,
+                (media_url,),
+            )
+            assert media_url not in json.dumps(result)
             assert (await client.get("/api/crawl-progress")).json() == []
         finally:
             job.cancel()
             await asyncio.gather(job, return_exceptions=True)
 
     browsers.open.assert_called_once()
-    scheduler.lease.assert_awaited_once_with(CRAWL, task.task_id, [])
+    scheduler.lease.assert_awaited_once_with(CRAWL, task.task_id, [], attempt_id=task.attempt_id)
     scheduler.release.assert_awaited_once_with(
         lease, "normal", None, None, listing_result="complete"
     )
@@ -156,11 +167,11 @@ async def test_listing_is_skipped_for_private_or_missing_creators(monkeypatch, c
 
 @pytest.fixture
 def listing_attempt(monkeypatch):
-    task = Task(
+    task = ClaimedTask(
         "task",
         1,
         "crawl_creator",
-        "batch",
+        "attempt",
         {"creator": {"handle": "alice"}, "cutoff": "2026-11-20T00:00:00Z", "max_works": 5},
     )
     lease = Lease("lease", "proxy:test", {"kind": "proxy"})

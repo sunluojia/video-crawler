@@ -4,7 +4,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +16,7 @@ from video_crawler.identities import Identity, IdentityPool
 from video_crawler.runner import Runner
 from video_crawler.scheduler import Lease, Scheduler
 from video_crawler.settings import Settings
-from video_crawler.store import Store
+from video_crawler.store import IdentityStore
 
 TOKEN = "t" * 16
 
@@ -25,7 +25,7 @@ TOKEN = "t" * 16
 def pool(tmp_path) -> IdentityPool:
     """调度中心分给本机 3 个。"""
     settings = Settings(service_token=TOKEN, profile_root=tmp_path)
-    store = Store(tmp_path / "state.db")
+    store = Mock(spec=IdentityStore)
     pool = IdentityPool(settings, store, Scheduler(settings), Browsers("chrome"))
     pool.target = 3
     pool.browser = "146"
@@ -33,8 +33,8 @@ def pool(tmp_path) -> IdentityPool:
 
 
 def control(pool: IdentityPool) -> TestClient:
-    store = pool._store
-    app = control_api(TOKEN, store, Runner(store, {}, {}), pool, pool._scheduler)
+    runner = Runner(pool._scheduler, {}, {}, available_identities=lambda: 0, publish=AsyncMock())
+    app = control_api(TOKEN, runner, pool, pool._scheduler)
     return TestClient(app, headers={"Authorization": f"Bearer {TOKEN}"})
 
 
@@ -105,6 +105,34 @@ def test_the_pool_tops_up_to_what_the_scheduler_assigns(pool):
     assert pool._next() is None
     blocked.cooldown_until = 0
     assert pool._next() is blocked  # 无法新建时，冷却结束的资料仍能恢复
+
+
+def test_take_prefers_the_exact_cached_identity_only_if_it_is_available(pool):
+    first = add(pool, "first")
+    preferred = add(pool, "second", fails=1)
+    assert pool.take(preferred_id=preferred.id) is preferred
+    assert pool.take(preferred_id=preferred.id) is first
+
+
+async def test_identity_metadata_is_restored_without_a_session_and_persisted_without_cookies(pool):
+    existing = Identity("a123456789ab", fails=2)
+    orphan = "b123456789ab"
+    pool._root.joinpath(existing.id).mkdir()
+    pool._root.joinpath(orphan).mkdir()
+    pool._store.records.return_value = [existing.record(), Identity("../unsafe").record()]
+
+    await pool.restore()
+    assert set(pool.identities) == {existing.id, orphan}
+    ready = pool.identities[existing.id]
+    assert ready.fails == 2 and ready.session is None
+    pool.refreshed(ready, Session({"tt_chain_token": "test-token"}, "ua", "146"))
+    pool.give_back(ready)
+    await pool.persist()
+
+    [saved] = pool._store.save.call_args.args[0]
+    assert saved == ready.record()
+    assert {"session", "token", "cookies"}.isdisjoint(saved)
+    assert pool._dirty == {}
 
 
 def test_refill_recovers_expired_profiles_before_refreshing_live_sessions(pool):

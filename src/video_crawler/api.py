@@ -17,12 +17,10 @@ from video_crawler.identities import IdentityPool
 from video_crawler.proxycheck import check_proxy, measure_speed
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import Scheduler
-from video_crawler.store import Store
 
 
 def control_api(
     token: str,
-    store: Store,
     runner: Runner,
     pool: IdentityPool,
     scheduler: Scheduler,
@@ -39,26 +37,23 @@ def control_api(
             raise HTTPException(401, "服务凭据无效")
 
     app = FastAPI(title="爬取程序", dependencies=[Depends(authorized)])
-    # 控制接口用 async，和任务队列在同一个事件循环里；测试代理要等网络，放在线程里跑
+    # 控制操作与执行器共用事件循环；代理测试放在线程里执行。
 
     @app.post("/api/batches/{batch_id}/{action}", status_code=204)
+    @app.post("/batches/{batch_id}/{action}", status_code=204, include_in_schema=False)
     async def control_batch(batch_id: str, action: str) -> None:
-        """暂停采集：不再开始新的获取作品，进行中的做完，下载照常；
-        取消关掉进行中的尝试，之后收到的任务也丢掉。"""
+        """暂停批次的在途采集，或取消该批次的所有在途尝试。"""
         if action == "pause":
-            store.pause(batch_id)
+            runner.pause(batch_id)
         elif action == "resume":
-            store.resume(batch_id)
-            runner.wake()
+            runner.resume(batch_id)
         elif action == "cancel":
-            store.cancel_batch(batch_id)
             runner.cancel(batch_id=batch_id)
         else:
             raise HTTPException(404)
 
     @app.post("/api/tasks/{task_id}/cancel", status_code=204)
     async def cancel_task(task_id: str) -> None:
-        store.cancel_task(task_id)
         runner.cancel(task_id=task_id)
 
     @app.post("/api/identities/{identity_id}/{action}", status_code=204)
@@ -77,11 +72,8 @@ def control_api(
     @app.get("/api/status")
     async def status() -> dict:
         """运行状态，调度中心“执行程序”页显示，格式见调度中心设计文档第 4.4 节。"""
-        unfinished = store.unfinished()
-
         def jobs(kind: str) -> dict:
-            running = runner.busy(kind)
-            return {"running": running, "queued": unfinished.get(kind, 0) - running}
+            return {"running": runner.busy(kind), "queued": 0}
 
         paused = runner.paused_until > time.time()
         return {
@@ -89,11 +81,16 @@ def control_api(
             "download": jobs(DOWNLOAD_VIDEO),
             "identities": pool.summary(),
             "leases": len(scheduler.leases),
-            "paused_batches": store.paused(),
+            "paused_batches": sorted(runner.paused_batches),
             "download_paused_until": (
                 datetime.fromtimestamp(runner.paused_until, UTC).isoformat() if paused else None
             ),
         }
+
+    @app.get("/api/health")
+    @app.get("/health", include_in_schema=False)
+    async def health() -> dict:
+        return {"status": "ok"}
 
     @app.get("/api/crawl-progress")
     async def crawl_progress() -> list[CrawlProgress]:
@@ -106,6 +103,11 @@ def control_api(
         if download_speed is not None:
             response.headers["X-Download-Bytes-Per-Second"] = str(download_speed())
         return downloads()
+
+    @app.get("/api/progress")
+    @app.get("/progress", include_in_schema=False)
+    async def progress(response: Response) -> dict:
+        return {"crawls": crawls(), "downloads": await download_progress(response)}
 
     @app.post("/api/proxy-tests")
     def proxy_tests(body: dict) -> list[dict]:

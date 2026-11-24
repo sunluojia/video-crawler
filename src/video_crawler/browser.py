@@ -68,6 +68,16 @@ class Browsers:
                 self._open -= 1
                 self._changed.notify_all()
 
+    async def _headless_agent(self) -> str:
+        """无头时 Chrome 的 UA 带 HeadlessChrome，换成正常写法；版本和系统取本机 Chrome 的，
+        这样预热和有界面采集时的 UA 一致，Chrome 升级后也跟着变。"""
+        browser = await self._playwright.chromium.launch(channel=self._channel, headless=True)
+        try:
+            page = await browser.new_page()
+            return (await page.evaluate("navigator.userAgent")).replace("HeadlessChrome", "Chrome")
+        finally:
+            await browser.close()
+
     @asynccontextmanager
     async def open(
         self, profile: Path, route: dict, *, warming: bool = False
@@ -82,11 +92,7 @@ class Browsers:
             if proxy is None:
                 options["args"] = ["--no-proxy-server"]  # 直连线路也忽略系统代理和 PAC
             if headless:
-                # 无头时 Chrome 的 UA 会带 HeadlessChrome，换成正常 UA。
-                options["user_agent"] = (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
-                )
+                options["user_agent"] = await self._headless_agent()
             context = await self._playwright.chromium.launch_persistent_context(
                 str(profile),
                 channel=self._channel,

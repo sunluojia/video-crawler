@@ -255,14 +255,17 @@ async def _read_listing(
 def _http_wait(response: Response, step: str) -> _CrawlWait | None:
     if response.status == 429:
         return _CrawlWait(
-            _retry_after(response.headers.get("retry-after")), f"{step}限流（429）", "throttled"
+            retry_after_seconds(response.headers.get("retry-after")),
+            f"{step}限流（429）",
+            "throttled",
         )
     if response.status == 407:
         return _CrawlWait(60, f"{step}代理认证失败（407）", "auth_failed")
     return None
 
 
-def _retry_after(value: str | None) -> int:
+def retry_after_seconds(value: str | None) -> int:
+    """Retry-After 的秒数：可以是秒数或 HTTP 日期；没有或看不懂时按 60 秒。"""
     if value is None:
         return 60
     try:

@@ -20,6 +20,7 @@ from patchright.async_api import Error as BrowserError
 
 from video_crawler import tiktok
 from video_crawler.browser import Browsers, page_data, session_of
+from video_crawler.crawl import retry_after_seconds
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.routes import proxy_reachable, proxy_url
@@ -182,7 +183,7 @@ class Downloader:
                     cookies=identity.session.cookies,
                 )
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After") or 60)
+                retry_after = retry_after_seconds(response.headers.get("Retry-After"))
                 outcome, detail = "throttled", "读作品页被限流（429）"
                 raise Wait(retry_after, detail)
             data = tiktok.scope_in_html(response.text) if response.status_code == 200 else None
@@ -284,7 +285,7 @@ async def transfer(
             if status == 407:
                 raise Stop("代理认证失败（407）", "auth_failed")
             if status == 429:
-                retry_after = int(response.headers.get("Retry-After") or 60)
+                retry_after = retry_after_seconds(response.headers.get("Retry-After"))
                 raise Stop("视频服务器限流（429）", "throttled", retry_after)
             if status == 206:
                 raise Broken("收到部分内容（206）")

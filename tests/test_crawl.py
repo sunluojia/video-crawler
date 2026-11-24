@@ -324,8 +324,8 @@ async def test_an_unreadable_listing_is_login_required_or_keeps_the_profile(
 
 
 def test_retry_after_accepts_seconds_http_dates_and_missing_headers():
-    assert crawl._retry_after("7200") == 7200
+    assert crawl.retry_after_seconds("7200") == 7200
     date = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
-    assert 118 <= crawl._retry_after(date) <= 120
-    assert crawl._retry_after("later") == 60
-    assert crawl._retry_after(None) == 60
+    assert 118 <= crawl.retry_after_seconds(date) <= 120
+    assert crawl.retry_after_seconds("later") == 60
+    assert crawl.retry_after_seconds(None) == 60

@@ -123,6 +123,15 @@ async def serve(settings: Settings) -> None:
     background = [
         asyncio.create_task(job) for job in (runner.run(), pool.run(), deliver(), heartbeat())
     ]
+
+    def stopped(job: asyncio.Task) -> None:
+        """后台循环出错停下时整个程序退出：设备显示离线、由重启策略拉起，而不是在线却不干活。"""
+        if not job.cancelled() and (error := job.exception()):
+            log.critical("后台循环出错停止，程序退出", exc_info=error)
+            server.should_exit = True
+
+    for job in background:
+        job.add_done_callback(stopped)
     try:
         await server.serve()
     finally:
@@ -135,6 +144,8 @@ async def serve(settings: Settings) -> None:
         await browsers.stop()
         with contextlib.suppress(httpx.HTTPError):
             await scheduler.withdraw()
+    if any(not job.cancelled() and job.exception() for job in background):
+        raise SystemExit(1)  # 出错退出，重启策略据此拉起
 
 
 def ignore_resets(loop: asyncio.AbstractEventLoop, context: dict) -> None:

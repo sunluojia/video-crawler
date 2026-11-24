@@ -23,7 +23,8 @@ def proxy_address(item: dict, protocol: str) -> str:
     """代理地址；主机为空表示本机端口，IPv6 主机加方括号。"""
     plain = item["host"] or "127.0.0.1"
     host = f"[{plain}]" if ":" in plain else plain
-    auth = f"{quote(item['username'])}:{quote(item['password'])}@" if item["username"] else ""
+    user, password = quote(item["username"] or "", safe=""), quote(item["password"] or "", safe="")
+    auth = f"{user}:{password}@" if item["username"] else ""
     return f"{protocol}://{auth}{host}:{item['port']}"
 
 

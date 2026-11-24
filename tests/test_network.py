@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 from base64 import b64encode
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +15,7 @@ from video_crawler import download
 from video_crawler.browser import Browsers
 from video_crawler.download import Broken, Skip, Stop
 from video_crawler.errors import Retry
-from video_crawler.proxycheck import Incomplete
+from video_crawler.proxycheck import Incomplete, proxy_address
 from video_crawler.proxycheck import download as speed_download
 from video_crawler.routes import browser_proxy, proxy_url
 
@@ -249,6 +251,24 @@ async def test_a_403_marks_the_token_as_refused(tmp_path):
         )
     assert stop.value.blocked
     assert stop.value.outcome == "suspect"
+
+
+async def test_a_429_with_an_http_date_waits_instead_of_failing(tmp_path):
+    later = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
+    with pytest.raises(Stop) as stop:
+        await download.transfer(
+            media_client(streamed(429, Retry_After=later)),
+            "https://v16.tiktokcdn.com/a",
+            tmp_path / "v.mp4",
+        )
+    assert stop.value.outcome == "throttled"
+    assert 118 <= stop.value.retry_after <= 120
+
+
+def test_proxy_test_escapes_every_special_character_in_the_password():
+    item = {"host": "10.0.0.2", "port": 1080, "username": "u", "password": "a/b@c:d"}
+    url = httpx.URL(proxy_address(item, "http"))
+    assert (url.host, url.username, url.password) == ("10.0.0.2", "u", "a/b@c:d")
 
 
 def speed_client(status: int, body: bytes) -> httpx.Client:

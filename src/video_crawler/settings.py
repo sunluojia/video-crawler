@@ -1,13 +1,14 @@
-"""运行参数，从环境变量（前缀 VC_）或 .env 读取。"""
+"""运行参数，从环境变量或 .env 读取。"""
 
 import socket
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SLOW_BYTES, SLOW_WINDOW = 20 * 1024, 45
 RANGE_PARTS, RANGE_MIN_BYTES = 4, 1024 * 1024
+MAX_VIDEO_HEIGHT = 720
 
 
 class Settings(BaseSettings):
@@ -35,6 +36,12 @@ class Settings(BaseSettings):
     """并发 HTTP Range 分片数，设为 1 时使用单流。"""
     download_range_min_bytes: int = Field(default=RANGE_MIN_BYTES, gt=0)
     """至少多少字节才试分片。"""
+    max_video_height: int = Field(
+        default=MAX_VIDEO_HEIGHT,
+        gt=0,
+        validation_alias=AliasChoices("CRAWLER_MAX_VIDEO_HEIGHT", "max_video_height"),
+    )
+    """优先下载的最高分辨率，横屏和竖屏均按短边计算。"""
     chrome_channel: str = "chrome"
     warm_headless: bool = True
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到

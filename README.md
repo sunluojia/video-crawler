@@ -32,6 +32,8 @@ uv run video-crawler
 
 声明支持字节范围并达到 1 MiB 的视频默认用 4 条并行 HTTP Range 拉取，各分片须返回 206 且范围、长度吻合。分片失败会重新用单流下载。`VC_DOWNLOAD_RANGE_PARTS=1` 可关闭分片，`VC_DOWNLOAD_RANGE_MIN_BYTES` 可调整最小文件字节数。
 
+下载默认优先选短边不超过 720 像素的最高可用档位，横屏和竖屏适用同一规则。同一档位优先 H.264，再按文件大小和码率排序。如果没有可用的合规码流，按原播放地址、码流地址和下载地址回退。可用 `CRAWLER_MAX_VIDEO_HEIGHT` 调整短边上限。
+
 控制接口默认监听 8091，使用服务凭据鉴权。`/api/health` 检查进程存活，`/api/status` 显示执行状态，`/api/progress` 合并采集与下载进度。`/api/batches/{id}/pause` 停止该批次的在途采集并归还尝试，下载继续执行。`resume` 恢复采集，`cancel` 停止该批次的所有在途尝试。身份操作和代理测试接口继续提供。
 
 `data/` 保存下载中的文件，`profiles/` 保存本机 Chrome 资料。两个目录均在 Git 忽略列表内。

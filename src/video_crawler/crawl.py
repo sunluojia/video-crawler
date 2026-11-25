@@ -23,6 +23,7 @@ from video_crawler.errors import Retry, Wait
 from video_crawler.identities import IdentityPool
 from video_crawler.routes import proxy_reachable
 from video_crawler.scheduler import CRAWL, MAX_RETRY_AFTER, ClaimedTask, ListingResult, Scheduler
+from video_crawler.settings import MAX_VIDEO_HEIGHT
 
 LIST_SECONDS = 30
 MAX_PAGES = 10
@@ -68,9 +69,11 @@ class Crawler:
         browsers: Browsers,
         *,
         media_cache: tiktok.MediaCache | None = None,
+        max_video_height: int = MAX_VIDEO_HEIGHT,
     ) -> None:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
         self._media = media_cache or tiktok.MediaCache()
+        self._max_video_height = max_video_height
         self._active: dict[str, CrawlProgress] = {}
 
     def progress(self) -> list[CrawlProgress]:
@@ -109,6 +112,7 @@ class Crawler:
                     self._pool.note,
                     progress,
                     on_media=partial(self._media.remember, identity.id),
+                    max_video_height=self._max_video_height,
                 )
                 session = await session_of(page)
             outcome = "normal"
@@ -158,6 +162,7 @@ async def _read(
     progress: CrawlProgress,
     *,
     on_media: Callable[[str, list[str]], None] | None = None,
+    max_video_height: int = MAX_VIDEO_HEIGHT,
 ) -> dict:
     pages: asyncio.Queue[ListingPage] = asyncio.Queue()
 
@@ -193,7 +198,10 @@ async def _read(
         return {"conclusion": conclusion, "profile": profile}
 
     listing = tiktok.Listing(
-        datetime.fromisoformat(body["cutoff"]), progress.max_works, on_media=on_media
+        datetime.fromisoformat(body["cutoff"]),
+        progress.max_works,
+        on_media=on_media,
+        max_video_height=max_video_height,
     )
     try:
         works = await _read_listing(page, pages, listing, line, progress)

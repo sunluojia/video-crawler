@@ -75,13 +75,20 @@ async def _serve(settings: Settings, redis: Redis) -> None:
     pool = IdentityPool(settings, store, scheduler, browsers)
     await pool.restore()
     media_cache = tiktok.MediaCache()
-    crawler = Crawler(pool, scheduler, browsers, media_cache=media_cache)
+    crawler = Crawler(
+        pool,
+        scheduler,
+        browsers,
+        media_cache=media_cache,
+        max_video_height=settings.max_video_height,
+    )
     downloader = Downloader(
         pool,
         scheduler,
         browsers,
         settings.data_dir / "videos",
         media_cache=media_cache,
+        max_video_height=settings.max_video_height,
         slow_bytes=settings.download_slow_bytes,
         slow_window=settings.download_slow_window,
         range_parts=settings.download_range_parts,

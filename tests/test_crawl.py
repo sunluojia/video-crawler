@@ -74,12 +74,18 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
         )
 
     media_url = "https://v16.tiktokcdn.com/a?signature=test"
+    primary = "https://v16.tiktokcdn.com/720"
+    video = {
+        "playAddr": primary,
+        "bitrateInfo": [
+            {"GearName": "normal_720_0", "PlayAddr": {"UrlList": [primary]}},
+            {"GearName": "normal_540_0", "PlayAddr": {"UrlList": [media_url]}},
+        ],
+    }
 
     async def goto(*args, **kwargs):
         # 首屏作品页可能先于达人资料到达。
-        await respond(
-            "0", "1", [item("7", -1, video={"playAddr": media_url}), item("8", 1)], more=True
-        )
+        await respond("0", "1", [item("7", -1, video=video), item("8", 1)], more=True)
         profile_opened.set()
         await finish_profile.wait()
 
@@ -98,7 +104,9 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
 
     browsers = SimpleNamespace(open=Mock(side_effect=open_browser))
     media_cache = tiktok.MediaCache()
-    crawler = crawl.Crawler(pool, scheduler, browsers, media_cache=media_cache)
+    crawler = crawl.Crawler(
+        pool, scheduler, browsers, media_cache=media_cache, max_video_height=540
+    )
     token = "t" * 16
     runner = Runner(scheduler, {}, {}, available_identities=lambda: 0, publish=AsyncMock())
     app = control_api(token, runner, pool, scheduler, crawls=crawler.progress)

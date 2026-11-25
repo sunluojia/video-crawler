@@ -169,6 +169,25 @@ async def test_disk_full_wait_is_scoped_to_downloads(attempt, monkeypatch, write
     assert not attempt.run.progress()
 
 
+@pytest.mark.parametrize("http_page_available", [True, False], ids=["http", "chrome"])
+async def test_download_fetches_the_preferred_quality_from_either_page_source(
+    attempt, http_page_available
+):
+    hd = "https://v16.tiktokcdn.com/hd"
+    video = {
+        "playAddr": hd,
+        "bitrateInfo": [
+            {"GearName": "normal_1080_0", "PlayAddr": {"UrlList": [hd]}},
+            {"GearName": "normal_720_0", "PlayAddr": {"UrlList": [FRESH]}},
+        ],
+    }
+    attempt.curl_response.text = html(page_data(video)) if http_page_available else "challenge"
+    attempt.browser_data.return_value = page_data(video)
+    await attempt.run(attempt.task)
+    assert [entry for entry in attempt.trace if entry[0] == "fetch"] == [("fetch", FRESH)]
+    attempt.scheduler.upload.assert_awaited_once()
+
+
 async def test_us_page_lease_is_released_before_hk_media_is_requested(attempt):
     await attempt.run(attempt.task)
     assert attempt.trace == [

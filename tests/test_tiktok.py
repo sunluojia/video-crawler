@@ -3,8 +3,10 @@
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from video_crawler import tiktok
+from video_crawler.settings import Settings
 
 CUTOFF = datetime(2026, 11, 1, tzinfo=UTC)
 DAY = 86400
@@ -150,6 +152,137 @@ def test_media_candidates_in_order_without_duplicates():
         "https://v19.tiktokcdn.com/hd",
         "https://v16.tiktokcdn.com/download",
     ]
+
+
+def cdn(name):
+    return f"https://v16.tiktokcdn.com/{name}"
+
+
+def stream(*urls, gear=None, dimensions=None, size=None, bitrate=None, codec="h264"):
+    address = {"UrlList": list(urls), "DataSize": size}
+    if dimensions is not None:
+        address["Width"], address["Height"] = dimensions
+    return {"PlayAddr": address, "GearName": gear, "Bitrate": bitrate, "CodecType": codec}
+
+
+@pytest.mark.parametrize(
+    ("within_cap", "above_cap"),
+    [((720, 1280), (1080, 1920)), ((1280, 720), (1920, 1080))],
+    ids=["portrait", "landscape"],
+)
+def test_media_limits_the_short_edge_and_uses_dimensions_over_labels(within_cap, above_cap):
+    data = video_scope(
+        playAddr=cdn("main"),
+        bitrateInfo=[
+            stream(cdn("hd"), gear="normal_720_0", dimensions=above_cap),
+            stream(cdn("720"), gear="normal_1080_0", dimensions=within_cap),
+            stream(cdn("540"), dimensions=(540, 960), size=10),
+        ],
+        downloadAddr=cdn("download"),
+    )
+    assert tiktok.media_of(data, "7") == [cdn("720"), cdn("540")]
+
+
+def test_media_uses_labels_when_dimensions_are_missing():
+    data = video_scope(
+        playAddr=cdn("hd"),
+        bitrateInfo=[
+            stream(cdn("540"), gear="normal_540_0"),
+            stream(cdn("hd"), gear="normal_1080_0"),
+            stream(cdn("720"), gear="adapt_lower_720_1"),
+            {"ratio": "480p", "playAddr": {"urlList": [cdn("480")]}},
+        ],
+    )
+    assert tiktok.media_of(data, "7") == [cdn("720"), cdn("540"), cdn("480")]
+
+
+@pytest.mark.parametrize("metadata", [{"ratio": "720p"}, {"width": "720", "height": 1280}])
+def test_media_uses_top_level_metadata_only_for_the_matching_stream(metadata):
+    data = video_scope(
+        **metadata,
+        playAddr=cdn("main"),
+        bitrateInfo=[stream(cdn("unknown")), stream(cdn("main"), cdn("main-mirror"))],
+        downloadAddr=cdn("download"),
+    )
+    assert tiktok.media_of(data, "7") == [cdn("main"), cdn("main-mirror")]
+
+
+@pytest.mark.parametrize("codec", ["h265_hvc1", "bytevc2"])
+def test_media_prefers_h264_over_smaller_alternative_encodings(codec):
+    data = video_scope(
+        bitrateInfo=[
+            stream(cdn("alt"), gear="normal_720_0", codec=codec, size="1200", bitrate=100),
+            stream(cdn("h264"), gear="normal_720_0", size="1500", bitrate=200),
+        ],
+    )
+    assert tiktok.media_of(data, "7") == [cdn("h264"), cdn("alt")]
+
+
+def test_media_uses_file_size_then_bitrate_and_deduplicates_with_a_url_limit():
+    data = video_scope(
+        bitrateInfo=[
+            stream(cdn("bigger"), gear="normal_720_0", size="2000", bitrate=100),
+            stream(cdn("higher-rate"), gear="normal_720_0", size="1500", bitrate=200),
+            stream(
+                cdn("lowest-rate"),
+                cdn("mirror"),
+                cdn("lowest-rate"),
+                gear="normal_720_0",
+                size="1500",
+                bitrate=150,
+            ),
+        ],
+    )
+    assert tiktok.media_of(data, "7") == [cdn("lowest-rate"), cdn("mirror"), cdn("higher-rate")]
+
+
+def test_media_uses_bitrate_when_file_sizes_are_missing_or_invalid():
+    data = video_scope(
+        bitrateInfo=[
+            stream(cdn("high-rate"), gear="normal_720_0", bitrate=200),
+            stream(cdn("low-rate"), gear="normal_720_0", size="unknown", bitrate="100"),
+            stream(cdn("unknown"), gear="normal_720_0", size=0, bitrate=-1),
+        ],
+    )
+    assert tiktok.media_of(data, "7") == [cdn("low-rate"), cdn("high-rate"), cdn("unknown")]
+
+
+@pytest.mark.parametrize("play_url", [cdn("main"), None])
+def test_media_preserves_original_fallback_with_only_an_hd_stream(play_url):
+    data = video_scope(
+        playAddr=play_url,
+        bitrateInfo=[
+            None,
+            stream(None, "http://example.com/insecure", gear="normal_720_0"),
+            stream(cdn("hd"), cdn("hd"), dimensions=(1080, 1920)),
+        ],
+        downloadAddr=cdn("download"),
+    )
+    fallback = [url for url in (play_url, cdn("hd"), cdn("download")) if url]
+    assert tiktok.media_of(data, "7") == fallback
+
+
+def test_media_quality_limit_can_be_configured_in_the_environment(monkeypatch):
+    monkeypatch.setenv("CRAWLER_MAX_VIDEO_HEIGHT", "540")
+    settings = Settings(service_token="test", _env_file=None)
+    data = video_scope(
+        bitrateInfo=[
+            stream(cdn("720"), gear="normal_720_0"),
+            stream(cdn("540"), gear="normal_540_0"),
+        ],
+    )
+    assert settings.max_video_height == 540
+    assert tiktok.media_of(data, "7", settings.max_video_height) == [cdn("540")]
+    monkeypatch.setenv("CRAWLER_MAX_VIDEO_HEIGHT", "0")
+    with pytest.raises(ValidationError, match="CRAWLER_MAX_VIDEO_HEIGHT"):
+        Settings(service_token="test", _env_file=None)
+
+
+def test_media_quality_limit_can_be_configured_in_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("CRAWLER_MAX_VIDEO_HEIGHT", raising=False)
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("CRAWLER_MAX_VIDEO_HEIGHT=1080\n", encoding="utf-8")
+    assert Settings(service_token="test", _env_file=dotenv).max_video_height == 1080
 
 
 def test_missing_or_other_videos():

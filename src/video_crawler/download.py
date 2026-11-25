@@ -30,7 +30,13 @@ from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import DownloadCredentials, Identity, IdentityPool
 from video_crawler.routes import proxy_reachable, proxy_url
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease, Scheduler
-from video_crawler.settings import RANGE_MIN_BYTES, RANGE_PARTS, SLOW_BYTES, SLOW_WINDOW
+from video_crawler.settings import (
+    MAX_VIDEO_HEIGHT,
+    RANGE_MIN_BYTES,
+    RANGE_PARTS,
+    SLOW_BYTES,
+    SLOW_WINDOW,
+)
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +160,7 @@ class Downloader:
         folder: Path,
         *,
         media_cache: tiktok.MediaCache | None = None,
+        max_video_height: int = MAX_VIDEO_HEIGHT,
         slow_bytes: int = SLOW_BYTES,
         slow_window: float = SLOW_WINDOW,
         range_parts: int = RANGE_PARTS,
@@ -162,6 +169,7 @@ class Downloader:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
         self._folder = folder
         self._media = media_cache or tiktok.MediaCache()
+        self._max_video_height = max_video_height
         self._slow_bytes, self._slow_window = slow_bytes, slow_window
         self._range_parts, self._range_min_bytes = range_parts, range_min_bytes
         self._active: dict[str, DownloadProgress] = {}
@@ -309,12 +317,16 @@ class Downloader:
             _check_address_status(response.status_code, response.headers.get("Retry-After"))
             if response.status_code == 200:
                 with suppress(ValueError):
-                    return _page_media(tiktok.scope_in_html(response.text), work["work_id"])
+                    return _page_media(
+                        tiktok.scope_in_html(response.text), work["work_id"], self._max_video_height
+                    )
             async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
                 navigation = await page.goto(work["url"], wait_until="domcontentloaded")
                 if navigation is not None:
                     _check_address_status(navigation.status, navigation.headers.get("retry-after"))
-                candidates = _page_media(await page_data(page), work["work_id"])
+                candidates = _page_media(
+                    await page_data(page), work["work_id"], self._max_video_height
+                )
                 self._pool.refreshed(identity, await session_of(page))
                 return candidates
         except LookupError as error:
@@ -389,10 +401,10 @@ class Downloader:
         raise Stop(reason or "没有可用的媒体地址", outcome, stale=skipped == len(candidates))
 
 
-def _page_media(data: dict | None, work_id: str) -> list[str]:
+def _page_media(data: dict | None, work_id: str, max_video_height: int) -> list[str]:
     if data is None:
         raise ValueError("作品页没有页面数据，可能停在了挑战页")
-    candidates = tiktok.media_of(data, work_id)
+    candidates = tiktok.media_of(data, work_id, max_video_height)
     if not candidates:
         raise ValueError("作品页里没有媒体地址")
     return candidates

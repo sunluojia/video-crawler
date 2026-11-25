@@ -13,7 +13,11 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from math import inf
+from operator import itemgetter
 from urllib.parse import parse_qs, urlsplit
+
+from video_crawler.settings import MAX_VIDEO_HEIGHT
 
 HOME = "https://www.tiktok.com/"
 DATA_ID = "__UNIVERSAL_DATA_FOR_REHYDRATION__"
@@ -25,6 +29,7 @@ ITEM_GONE = 10204
 """作品不存在（item doesn't exist）。"""
 
 _DATA = re.compile(rf'<script id="{DATA_ID}"[^>]*>(.*?)</script>', re.S)
+_RESOLUTION_LABEL = re.compile(r"(?:^|[_-])([1-9][0-9]{2,3})p?(?=$|[_-])", re.IGNORECASE)
 
 
 def scope(raw: str | None) -> dict | None:
@@ -71,10 +76,8 @@ def profile_of(data: dict, handle: str) -> tuple[str | None, dict | None]:
     return ("private" if user.get("privateAccount") else None), profile
 
 
-def media_of(data: dict, work_id: str) -> list[str]:
-    """作品页数据里的媒体地址候选：主播放地址、各码率地址、下载地址，去重后最多 3 个。
-
-    作品不存在时抛 LookupError，其他读不到的情况抛 ValueError。"""
+def media_of(data: dict, work_id: str, max_video_height: int = MAX_VIDEO_HEIGHT) -> list[str]:
+    """读取作品页的媒体候选，按短边限制选流。作品不存在或页面无效时抛出异常。"""
     detail = data.get("webapp.video-detail") or {}
     if not isinstance(detail, dict):
         raise ValueError("作品页的详情格式无效")
@@ -86,29 +89,87 @@ def media_of(data: dict, work_id: str) -> list[str]:
         raise ValueError(
             f"作品页没有这条视频（{detail.get('statusCode')} {detail.get('statusMsg')}）"
         )
-    return media_candidates(item)
+    return media_candidates(item, max_video_height)
 
 
-def media_candidates(item: dict) -> list[str]:
-    """单条作品和列表共用同一套媒体字段，忽略缺失或无效的可选字段。"""
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def _short_edge(address: dict) -> int | None:
+    width = _positive_int(address.get("Width") or address.get("width"))
+    height = _positive_int(address.get("Height") or address.get("height"))
+    return min(width, height) if width and height else None
+
+
+def _label_height(value: object) -> int | None:
+    if isinstance(value, str) and (match := _RESOLUTION_LABEL.search(value.strip())):
+        return int(match[1])
+    return None
+
+
+def _codec_rank(codec_type: object) -> int:
+    codec = codec_type.casefold().strip() if isinstance(codec_type, str) else ""
+    if codec.startswith(("h264", "avc")):
+        return 0
+    if not codec or codec.startswith(("h265", "hevc", "hvc1", "hev1", "bytevc1", "av1", "av01")):
+        return 1
+    return 2
+
+
+def _https_urls(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [url for url in values if isinstance(url, str) and url.startswith("https://")]
+
+
+def media_candidates(item: dict, max_video_height: int = MAX_VIDEO_HEIGHT) -> list[str]:
+    """优先返回符合短边限制的码流。没有可用的合规地址时保留原来的回退顺序。"""
     video = item.get("video")
     if not isinstance(video, dict):
         return []
-    urls = [video.get("playAddr")]
+    play_url = video.get("playAddr")
+    fallback = _https_urls([play_url])
+    eligible = []
     rates = video.get("bitrateInfo")
     if isinstance(rates, list):
         for rate in rates:
             if not isinstance(rate, dict):
                 continue
             address = rate.get("PlayAddr") or rate.get("playAddr")
-            if isinstance(address, dict):
-                variants = address.get("UrlList") or address.get("urlList")
-                if isinstance(variants, list):
-                    urls.extend(variants)
-    urls.append(video.get("downloadAddr"))
-    return list(
-        dict.fromkeys(url for url in urls if isinstance(url, str) and url.startswith("https://"))
-    )[:3]
+            if not isinstance(address, dict):
+                continue
+            urls = _https_urls(address.get("UrlList") or address.get("urlList"))
+            if not urls:
+                continue
+            fallback.extend(urls)
+            height = (
+                _short_edge(address)
+                or _label_height(rate.get("GearName") or rate.get("gearName"))
+                or _label_height(rate.get("Ratio") or rate.get("ratio"))
+            )
+            # 整条作品的宽高和 ratio 只能用来补足主播放地址对应的码流。
+            if height is None and play_url in urls:
+                height = _short_edge(video) or _label_height(video.get("ratio"))
+            if height is not None and height <= max_video_height:
+                rank = (
+                    -height,
+                    _codec_rank(rate.get("CodecType") or rate.get("codecType")),
+                    _positive_int(address.get("DataSize") or address.get("dataSize")) or inf,
+                    _positive_int(rate.get("Bitrate") or rate.get("bitrate")) or inf,
+                )
+                eligible.append((rank, urls))
+    if eligible:
+        ordered = (url for _, urls in sorted(eligible, key=itemgetter(0)) for url in urls)
+        return list(dict.fromkeys(ordered))[:3]
+    fallback.extend(_https_urls([video.get("downloadAddr")]))
+    return list(dict.fromkeys(fallback))[:3]
 
 
 @dataclass(frozen=True)
@@ -168,6 +229,7 @@ class Listing:
     oldest: int | None = None
     """读到的最早的普通作品的发布时间（秒）。"""
     on_media: Callable[[str, list[str]], None] | None = None
+    max_video_height: int = MAX_VIDEO_HEIGHT
 
     def add(self, cursor: str, page: dict) -> bool:
         """加一页。请求游标接不上已读页的不收，保证从第一页起没有缺页；
@@ -192,8 +254,10 @@ class Listing:
             if not item.get("isPinnedItem"):
                 created = int(item["createTime"])
                 self.oldest = created if self.oldest is None else min(self.oldest, created)
-            if self.on_media and not item.get("imagePost") and (urls := media_candidates(item)):
-                self.on_media(work_id, urls)
+            if self.on_media and not item.get("imagePost"):
+                urls = media_candidates(item, self.max_video_height)
+                if urls:
+                    self.on_media(work_id, urls)
         self.cursors.add(str(next_cursor))
         self.ended = self.ended or not more
         return True

@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from video_crawler.identities import IdentityPool
 from video_crawler.routes import proxy_reachable
 from video_crawler.scheduler import CRAWL, MAX_RETRY_AFTER, ClaimedTask, ListingResult, Scheduler
 from video_crawler.settings import MAX_VIDEO_HEIGHT
+
+log = logging.getLogger(__name__)
 
 LIST_SECONDS = 30
 MAX_PAGES = 10
@@ -111,6 +114,7 @@ class Crawler:
                     lease.line,
                     self._pool.note,
                     progress,
+                    identity_id=identity.id,
                     on_media=partial(self._media.remember, identity.id),
                     max_video_height=self._max_video_height,
                 )
@@ -150,8 +154,13 @@ class Crawler:
             finally:
                 if session:
                     self._pool.refreshed(identity, session)
-                result = "ok" if session and outcome == "normal" else "neutral"
-                self._pool.give_back(identity, result)
+                if listing_result == "empty_response":
+                    identity_result = "empty_response"
+                elif listing_result == "complete":
+                    identity_result = "listing_ok"
+                else:
+                    identity_result = "ok" if session and outcome == "normal" else "neutral"
+                self._pool.give_back(identity, identity_result)
 
 
 async def _read(
@@ -161,6 +170,7 @@ async def _read(
     note: Callable[[str, bool], None],
     progress: CrawlProgress,
     *,
+    identity_id: str,
     on_media: Callable[[str, list[str]], None] | None = None,
     max_video_height: int = MAX_VIDEO_HEIGHT,
 ) -> dict:
@@ -169,22 +179,23 @@ async def _read(
     async def on_response(response: Response) -> None:
         if tiktok.ITEM_LIST not in response.url:
             return
-        if wait := _http_wait(response, "作品列表"):
-            pages.put_nowait(wait)
-            return
-        if response.status != 200:
-            pages.put_nowait(ListingFailure(f"作品列表 HTTP {response.status}", line))
-            return
-        try:
-            async with asyncio.timeout(WAIT_PAGE):
-                content = await response.body()
-        except BrowserError:
-            pages.put_nowait(ListingFailure("作品列表正文读取失败", line))
-        except TimeoutError:
-            pages.put_nowait(ListingFailure("作品列表正文读取超时", line))
-        else:
-            note("list", bool(content))
-            pages.put_nowait((tiktok.request_cursor(response.url), content))
+        reply = await _listing_page(response, line)
+        content_bytes = None
+        if isinstance(reply, tuple):
+            content_bytes = len(reply[1])
+            note("list", content_bytes > 0)
+        log.info(
+            "listing_response %s",
+            json.dumps(
+                {
+                    "identity_id": identity_id,
+                    "line": line,
+                    "status": response.status,
+                    "content_bytes": content_bytes,
+                }
+            ),
+        )
+        pages.put_nowait(reply)
 
     def on_request_failed(request: Request) -> None:
         failure = request.failure or ""
@@ -211,6 +222,21 @@ async def _read(
         failure.profile = profile
         raise
     return {"conclusion": "ok", "profile": profile, "works": works}
+
+
+async def _listing_page(response: Response, line: str) -> ListingPage:
+    if wait := _http_wait(response, "作品列表"):
+        return wait
+    if response.status != 200:
+        return ListingFailure(f"作品列表 HTTP {response.status}", line)
+    try:
+        async with asyncio.timeout(WAIT_PAGE):
+            content = await response.body()
+    except BrowserError:
+        return ListingFailure("作品列表正文读取失败", line)
+    except TimeoutError:
+        return ListingFailure("作品列表正文读取超时", line)
+    return tiktok.request_cursor(response.url), content
 
 
 async def _needs_login(page: Page) -> bool:

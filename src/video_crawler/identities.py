@@ -14,6 +14,7 @@ from collections import Counter, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from patchright.async_api import Error as BrowserError
@@ -63,6 +64,12 @@ class Identity:
     session: Session | None = None
     busy: bool = False
     warm_retry_at: float = 0
+    listing_fails: int = 0
+    """当前浏览器会话中以空正文结束的采集次数。重启后会重新预热，所以只记在内存。"""
+
+    @property
+    def consecutive_failures(self) -> int:
+        return max(self.fails, self.listing_fails)
 
     def record(self) -> dict:
         return {
@@ -212,6 +219,8 @@ class IdentityPool:
         return {
             **record,
             **{key: record[key] or None for key in ("cooldown_until", "last_used_at", "warmed_at")},
+            "fails": identity.consecutive_failures,
+            "listing_fails": identity.listing_fails,
             "state": self._state(identity, now),
             "token_expires_at": identity.warmed_at + TOKEN_TTL if identity.fresh(now) else None,
         }
@@ -239,7 +248,12 @@ class IdentityPool:
         if not ready:
             raise Wait(10, "没有可用身份")
         identity = min(
-            ready, key=lambda item: (item.id != preferred_id, item.fails, item.last_used_at)
+            ready,
+            key=lambda item: (
+                item.id != preferred_id,
+                item.consecutive_failures,
+                item.last_used_at,
+            ),
         )
         identity.busy = True
         return identity
@@ -269,16 +283,27 @@ class IdentityPool:
         assert session is not None and session.token
         return session.user_agent, session.token
 
-    def give_back(self, identity: Identity, result: str = "neutral") -> None:
-        """用完归还。ok：成功，连续失败清零；blocked：下载被拒，冷却并作废 token；
-        neutral：结果不怪身份（出口问题、内容本身的结论）。"""
+    def give_back(
+        self,
+        identity: Identity,
+        result: Literal["neutral", "ok", "blocked", "listing_ok", "empty_response"] = "neutral",
+    ) -> None:
+        """归还身份，并根据下载或作品列表的结果更新对应的失败计数。"""
         now = time.time()
         identity.busy, identity.last_used_at = False, now
         self._available_changed.set()
         if result == "blocked":
             self._block(identity, now)
-        elif result == "ok" and identity.cooldown_until <= now:
-            identity.fails = 0
+        elif identity.cooldown_until <= now:
+            if result in ("ok", "listing_ok"):
+                identity.fails = 0
+                if result == "listing_ok":
+                    identity.listing_fails = 0
+            elif result == "empty_response":
+                identity.listing_fails += 1
+                if identity.listing_fails >= COUNTED_FAILS:
+                    identity.cooldown_until = now + COOLDOWN
+                    identity.session = None
         self._save_use(identity, now)
 
     def record_download(
@@ -461,6 +486,7 @@ class IdentityPool:
         log.info("身份 %s 预热好了", identity.id)
         self.browser = identity.browser = session.browser
         self.refreshed(identity, session)
+        identity.listing_fails = 0
         self._dirty[identity.id] = identity.record()
         self.identities[identity.id] = identity
         for other in list(self.identities.values()):

@@ -158,7 +158,7 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
         lease, "normal", None, None, listing_result="complete"
     )
     pool.refreshed.assert_called_once_with(identity, session)
-    pool.give_back.assert_called_once_with(identity, "ok")
+    pool.give_back.assert_called_once_with(identity, "listing_ok")
 
 
 @pytest.mark.parametrize("conclusion", ["private", "not_found"])
@@ -166,7 +166,7 @@ async def test_listing_is_skipped_for_private_or_missing_creators(monkeypatch, c
     progress = crawl.CrawlProgress("task", "alice", 5, stage="profile")
     monkeypatch.setattr(crawl, "_read_profile", AsyncMock(return_value=(conclusion, None)))
     page = SimpleNamespace(on=Mock())
-    assert await crawl._read(page, {}, "direct:test", Mock(), progress) == {
+    assert await crawl._read(page, {}, "direct:test", Mock(), progress, identity_id="visitor") == {
         "conclusion": conclusion,
         "profile": None,
     }
@@ -184,7 +184,10 @@ def listing_attempt(monkeypatch):
     )
     lease = Lease("lease", "proxy:test", {"kind": "proxy"})
     scheduler = SimpleNamespace(lease=AsyncMock(return_value=lease), release=AsyncMock())
-    pool = SimpleNamespace(take=Mock(), profile=Mock(), note=Mock(), give_back=Mock())
+    identity = Identity("abc123def456")
+    pool = SimpleNamespace(
+        take=Mock(return_value=identity), profile=Mock(), note=Mock(), give_back=Mock()
+    )
     handlers = {}
     page = SimpleNamespace(
         on=lambda event, callback: handlers.update({event: callback}),
@@ -211,6 +214,8 @@ def listing_attempt(monkeypatch):
         page=page,
         handlers=handlers,
         note=pool.note,
+        identity=identity,
+        give_back=pool.give_back,
         with_profile=with_profile,
         run=crawler,
     )
@@ -230,9 +235,10 @@ def listing_attempt(monkeypatch):
     ],
 )
 async def test_listing_reports_distinct_response_failures(
-    listing_attempt, status, body, result, detail, reloads
+    listing_attempt, caplog, status, body, result, detail, reloads
 ):
     attempt = listing_attempt
+    caplog.set_level("INFO", logger=crawl.__name__)
     read = (
         AsyncMock(side_effect=body) if isinstance(body, Exception) else AsyncMock(return_value=body)
     )
@@ -240,9 +246,9 @@ async def test_listing_reports_distinct_response_failures(
     async def respond(*_, **__):
         await attempt.handlers["response"](
             SimpleNamespace(
-                url="https://www.tiktok.com/api/post/item_list/?cursor=0",
+                url="https://www.tiktok.com/api/post/item_list/?cursor=0&sig=url-marker",
                 status=status,
-                headers={"retry-after": "120"},
+                headers={"retry-after": "120", "set-cookie": "cookie-marker"},
                 body=read,
             )
         )
@@ -276,6 +282,63 @@ async def test_listing_reports_distinct_response_failures(
     assert attempt.page.reload.await_count == reloads
     if isinstance(body, Exception):
         attempt.note.assert_not_called()
+    returned_as = {"complete": "listing_ok", "empty_response": "empty_response"}
+    attempt.give_back.assert_called_once_with(attempt.identity, returned_as.get(result, "neutral"))
+
+    responses = [
+        json.loads(message.removeprefix("listing_response "))
+        for message in caplog.messages
+        if message.startswith("listing_response ")
+    ]
+    assert responses == [
+        {
+            "identity_id": attempt.identity.id,
+            "line": attempt.lease.line,
+            "status": status,
+            "content_bytes": len(body) if status == 200 and isinstance(body, bytes) else None,
+        }
+    ] * (1 + reloads)
+    assert "url-marker" not in caplog.text
+    assert "cookie-marker" not in caplog.text
+    assert "statusCode" not in caplog.text
+
+
+@pytest.mark.parametrize("second_body", [b'{"statusCode": 0, "hasMore": false}', b""])
+async def test_empty_listing_retry_can_recover_or_reveal_login_requirement(
+    listing_attempt, second_body
+):
+    attempt = listing_attempt
+    attempt.page.evaluate.return_value = "This creator turned on\naudience controls"
+
+    async def emit(body):
+        await attempt.handlers["response"](
+            SimpleNamespace(
+                url="https://www.tiktok.com/api/post/item_list/?cursor=0",
+                status=200,
+                body=AsyncMock(return_value=body),
+            )
+        )
+
+    async def profile(*_):
+        await emit(b"")
+        return None, None
+
+    async def reload_page(**_):
+        await emit(second_body)
+
+    attempt.with_profile(profile)
+    attempt.page.reload.side_effect = reload_page
+    result = await attempt.run(attempt.task)
+
+    if second_body:
+        assert result["conclusion"] == "ok"
+        assert attempt.release.await_args.kwargs["listing_result"] == "complete"
+        attempt.give_back.assert_called_once_with(attempt.identity, "listing_ok")
+    else:
+        assert result["conclusion"] == "login_required"
+        assert attempt.release.await_args.kwargs["listing_result"] is None
+        attempt.give_back.assert_called_once_with(attempt.identity, "neutral")
+    assert attempt.page.reload.await_count == 1
 
 
 @pytest.mark.parametrize("reachable", [True, False])

@@ -188,6 +188,80 @@ async def test_success_and_blocked_return_refill_without_waiting_for_poll(pool, 
             await loop
 
 
+async def test_repeated_empty_listings_cool_and_rewarm_only_the_affected_identity(
+    pool, monkeypatch
+):
+    pool.target = 2
+    affected = add(pool, "affected")
+    healthy = add(pool, "healthy")
+    session = affected.session
+    for count in range(1, identities.COUNTED_FAILS):
+        assert pool.take(preferred_id=affected.id) is affected
+        pool.give_back(affected, "empty_response")
+        assert affected.listing_fails == count and affected.cooldown_until == 0
+        assert affected.session is session and pool.summary()["ready"] == 2
+
+    assert pool.take() is healthy
+    pool.give_back(healthy)
+    assert pool.take(preferred_id=affected.id) is affected
+    pool.give_back(affected, "empty_response")
+    state = next(item for item in pool.snapshot()["items"] if item["id"] == affected.id)
+    assert state["state"] == "cooling" and state["fails"] == identities.COUNTED_FAILS
+    assert affected.session is None
+    assert pool.available() == [healthy]
+    assert pool.profile(affected).is_dir()
+    replacement = pool._next()
+    assert replacement is not None and replacement.id not in pool.identities
+
+    affected.cooldown_until = time.time() - 1
+    assert pool._next() is affected
+    lease = Lease("lease", "proxy:test", {"kind": "proxy"})
+    monkeypatch.setattr(pool._scheduler, "lease", AsyncMock(return_value=lease))
+    monkeypatch.setattr(pool._scheduler, "release", AsyncMock())
+
+    @asynccontextmanager
+    async def open_browser(profile, route, *, warming):
+        assert (profile, route, warming) == (pool.profile(affected), lease.route, True)
+        yield SimpleNamespace(goto=AsyncMock(), wait_for_selector=AsyncMock())
+
+    monkeypatch.setattr(pool._browsers, "open", open_browser)
+    renewed = Session({"tt_chain_token": "renewed"}, "ua", "146")
+    monkeypatch.setattr(identities, "session_of", AsyncMock(return_value=renewed))
+    assert await pool._warm(affected)
+    assert affected.session is renewed and affected.listing_fails == 0
+    assert pool.available() == [affected, healthy]
+
+
+def test_listing_results_are_independent_of_download_feedback(pool):
+    identity = add(pool, "shared", fails=1)
+    token = identity.session.token
+    pool.take()
+    pool.give_back(identity, "empty_response")
+    pool.record_download(identity.id, blocked=False, succeeded=True, token=token)
+    assert identity.fails == 0 and identity.listing_fails == 1
+
+    pool.take()
+    pool.give_back(identity, "neutral")
+    pool.take()
+    pool.give_back(identity, "ok")
+    assert identity.listing_fails == 1
+
+    pool.take()
+    pool.give_back(identity, "listing_ok")
+    assert identity.listing_fails == 0
+
+
+def test_empty_listings_never_advance_the_download_retirement_counter(pool):
+    identity = add(pool, "shared", fails=identities.RETIRE_FAILS - 1)
+    for _ in range(identities.COUNTED_FAILS):
+        pool.take()
+        pool.give_back(identity, "empty_response")
+
+    assert identity.fails == identities.RETIRE_FAILS - 1
+    assert pool.identities[identity.id] is identity
+    assert pool.profile(identity).is_dir()
+
+
 def test_delayed_download_feedback_preserves_the_current_borrow_and_retirement(pool):
     identity = add(pool, "shared", fails=identities.RETIRE_FAILS - 2)
     token = identity.session.token

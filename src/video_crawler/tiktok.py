@@ -135,6 +135,10 @@ class MediaCache:
         self._prune(time.monotonic())
         return self._entries.get(work_id)
 
+    def has_usable(self, usable_identity: Callable[[str], bool]) -> bool:
+        self._prune(time.monotonic())
+        return any(usable_identity(links.identity_id) for links in self._entries.values())
+
     def discard(self, work_id: str, links: MediaLinks) -> None:
         if self._entries.get(work_id) is links:
             del self._entries[work_id]

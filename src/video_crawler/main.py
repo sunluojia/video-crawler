@@ -84,6 +84,8 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         media_cache=media_cache,
         slow_bytes=settings.download_slow_bytes,
         slow_window=settings.download_slow_window,
+        range_parts=settings.download_range_parts,
+        range_min_bytes=settings.download_range_min_bytes,
     )
     broker = RedisBroker(client=redis)
     broker.declare_queue(EVENTS)
@@ -95,6 +97,7 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         },
         {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0},  # 第一次心跳拿到并发数之前不开始
         available_identities=lambda: len(pool.available()),
+        cached_download=downloader.has_cached_media,
         publish=partial(publish_event, broker),
     )
     loop = asyncio.get_running_loop()

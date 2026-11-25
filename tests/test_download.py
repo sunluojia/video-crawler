@@ -1,9 +1,11 @@
+import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from errno import ENOSPC
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
@@ -11,9 +13,10 @@ from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 from video_crawler import download, tiktok
 from video_crawler.browser import Session
 from video_crawler.errors import Retry, Wait
-from video_crawler.identities import Identity
+from video_crawler.identities import Identity, IdentityPool
 from video_crawler.runner import DOWNLOAD_VIDEO
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease
+from video_crawler.settings import Settings
 
 WORK = "https://www.tiktok.com/@example/video/7"
 CACHED = "https://v16.tiktokcdn.com/cached"
@@ -42,9 +45,13 @@ def attempt(tmp_path, monkeypatch):
     )
     identity = Identity("visitor", session=Session({"tt_chain_token": "test"}, "UA", "1"))
     pool = SimpleNamespace(
-        take=Mock(return_value=identity),
+        take_for_download=AsyncMock(return_value=identity),
+        download_credentials=Mock(
+            side_effect=lambda key: ("UA", "test") if key == identity.id else None
+        ),
         give_back=Mock(),
         note=Mock(),
+        record_download=Mock(),
         profile=Mock(return_value=tmp_path / identity.id),
         refreshed=Mock(),
     )
@@ -97,7 +104,7 @@ def attempt(tmp_path, monkeypatch):
 
     @asynccontextmanager
     async def open_browser(profile, route):
-        assert profile == tmp_path / pool.take.return_value.id and route == RESIDENTIAL
+        assert profile == tmp_path / identity.id and route == RESIDENTIAL
         trace.append(("page", "chrome"))
         yield page
 
@@ -109,6 +116,7 @@ def attempt(tmp_path, monkeypatch):
         assert client.headers["Cookie"] == "tt_chain_token=test"
         assert client.timeout.read == options["slow_window"] == 45
         assert options["slow_bytes"] == 20 * 1024
+        assert (options["range_parts"], options["range_min_bytes"]) == (4, 1024 * 1024)
         trace.append(("fetch", url))
         if url in outcomes:
             raise outcomes[url]
@@ -139,7 +147,7 @@ def attempt(tmp_path, monkeypatch):
 
 
 async def test_download_does_not_request_a_line_without_an_identity(attempt):
-    attempt.pool.take.side_effect = Wait(10, "没有可用身份")
+    attempt.pool.take_for_download.side_effect = Wait(10, "没有可用身份")
     with pytest.raises(Wait, match="没有可用身份"):
         await attempt.run(attempt.task)
     attempt.scheduler.lease.assert_not_awaited()
@@ -172,7 +180,10 @@ async def test_us_page_lease_is_released_before_hk_media_is_requested(attempt):
         ("release", "HK", "normal"),
         ("upload",),
     ]
-    attempt.pool.give_back.assert_called_once_with(attempt.identity, "ok")
+    attempt.pool.give_back.assert_called_once_with(attempt.identity, "neutral")
+    attempt.pool.record_download.assert_called_once_with(
+        attempt.identity.id, blocked=False, succeeded=True, token="test"
+    )
 
 
 @pytest.mark.parametrize(
@@ -229,7 +240,8 @@ async def test_cache_hit_only_requests_the_download_lease(attempt):
         ("release", "HK", "normal"),
         ("upload",),
     ]
-    attempt.pool.take.assert_called_once_with(preferred_id=attempt.identity.id)
+    attempt.pool.take_for_download.assert_not_awaited()
+    attempt.pool.give_back.assert_not_called()
 
 
 async def test_cache_is_ignored_when_its_original_identity_is_unavailable(attempt):
@@ -257,8 +269,11 @@ async def test_stale_cached_links_retry_via_us_without_penalizing_the_identity(a
     ]
     assert (("fetch", second) in attempt.trace) == (failure == "skip")
     assert attempt.cache.get("7") is None
-    assert attempt.pool.note.call_args_list == [call("download", True)] * 2
-    attempt.pool.give_back.assert_called_once_with(attempt.identity, "ok")
+    attempt.pool.note.assert_called_once_with("download", failure != "403")
+    attempt.pool.record_download.assert_called_once_with(
+        attempt.identity.id, blocked=False, succeeded=True, token="test"
+    )
+    attempt.pool.give_back.assert_called_once_with(attempt.identity, "neutral")
 
 
 async def test_a_fresh_403_only_penalizes_the_download_line(attempt):
@@ -268,7 +283,103 @@ async def test_a_fresh_403_only_penalizes_the_download_line(attempt):
     assert failure.value.line == "HK"
     assert ("release", "US", "normal") in attempt.trace
     assert attempt.trace[-1] == ("release", "HK", "suspect")
-    attempt.pool.give_back.assert_called_once_with(attempt.identity, "blocked")
+    attempt.pool.give_back.assert_called_once_with(attempt.identity, "neutral")
+    attempt.pool.record_download.assert_called_once_with(
+        attempt.identity.id, blocked=True, succeeded=False, token="test"
+    )
+
+
+@pytest.fixture
+def live_pool(attempt, tmp_path):
+    identity = attempt.identity
+    identity.browser, identity.warmed_at = identity.session.browser, time.time()
+    pool = IdentityPool(
+        Settings(service_token="test", profile_root=tmp_path),
+        Mock(),
+        attempt.scheduler,
+        attempt.run._browsers,
+    )
+    pool.browser = identity.browser
+    pool.identities[identity.id] = identity
+    attempt.run._pool = pool
+    return pool
+
+
+@pytest.mark.parametrize("cache_hit", [False, True], ids=["fresh-link", "cached-while-busy"])
+async def test_download_uses_a_snapshot_while_another_task_holds_the_identity(
+    attempt, live_pool, cache_hit
+):
+    got_credentials, may_fetch = asyncio.Event(), asyncio.Event()
+    grant = attempt.scheduler.lease.side_effect
+    release = attempt.scheduler.release.side_effect
+
+    async def lease(use, *args, **kwargs):
+        if use == DOWNLOAD and cache_hit:
+            got_credentials.set()
+            await may_fetch.wait()
+        return await grant(use, *args, **kwargs)
+
+    async def release_line(line, *args, **kwargs):
+        if line.line == "US":
+            got_credentials.set()
+            await may_fetch.wait()
+        return await release(line, *args, **kwargs)
+
+    attempt.scheduler.lease.side_effect = lease
+    attempt.scheduler.release.side_effect = release_line
+    if cache_hit:
+        attempt.cache.remember(attempt.identity.id, "7", [CACHED])
+        borrowed = live_pool.take()
+        assert attempt.run.has_cached_media() and attempt.run.has_cached_media("7")
+
+    work = asyncio.create_task(attempt.run(attempt.task))
+    try:
+        await asyncio.wait_for(got_credentials.wait(), 1)
+        if not cache_hit:
+            borrowed = live_pool.take()
+        assert borrowed is attempt.identity and borrowed.busy
+        live_pool.refreshed(borrowed, Session({"tt_chain_token": "new"}, "new-UA", "1"))
+        # The transfer fixture checks that the headers still use the original credentials.
+        may_fetch.set()
+        await asyncio.wait_for(work, 1)
+        assert borrowed.busy
+        assert live_pool.download_credentials(borrowed.id) == ("new-UA", "new")
+        assert [lease.line for lease in attempt.leases] == (["HK"] if cache_hit else ["US", "HK"])
+    finally:
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
+        live_pool.give_back(attempt.identity)
+
+
+async def test_fresh_403_cools_the_original_identity_during_concurrent_crawl(
+    attempt, live_pool, monkeypatch
+):
+    transfer = download.transfer
+
+    async def refused(*args, **kwargs):
+        assert live_pool.take(preferred_id=attempt.identity.id) is attempt.identity
+        return await transfer(*args, **kwargs)
+
+    original_session = attempt.identity.session
+    other = Identity("other", browser="1", warmed_at=time.time(), last_used_at=time.time())
+    other.session = Session({"tt_chain_token": "other"}, "other-UA", "1")
+    live_pool.identities[other.id] = other
+    monkeypatch.setattr(download, "transfer", refused)
+    attempt.outcomes[FRESH] = download.Stop("403", blocked=True, stale=True)
+
+    try:
+        with pytest.raises(Retry, match="403"):
+            await attempt.run(attempt.task)
+        assert attempt.identity.busy
+        assert attempt.identity.fails == 1 and attempt.identity.session is None
+        assert attempt.identity.cooldown_until > time.time()
+        assert live_pool.available() == [other]
+        snapshot = live_pool.snapshot()
+        assert (snapshot["download_total"], snapshot["download_blocked"]) == (1, 1)
+        live_pool.refreshed(attempt.identity, original_session)
+    finally:
+        live_pool.give_back(attempt.identity, "ok")
+    assert attempt.identity.fails == 1 and attempt.identity.session is None
 
 
 async def test_windows_cleanup_error_keeps_the_original_failure(attempt, caplog, monkeypatch):

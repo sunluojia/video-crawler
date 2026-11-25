@@ -1,9 +1,10 @@
 """下载一条视频（download_video），见单视频下载方案第 2、3 节和爬取方案第 5 节。
 
 优先复用同身份从列表拿到的媒体地址。需要读作品页时借采集线路，归还后再借下载线路拉取媒体。
-下载使用同一身份的 token，传输完成后校验、落盘并上传。
+拉流只使用同一身份的 UA 和 token 快照，传输完成后校验、落盘并上传。
 """
 
+import asyncio
 import errno
 import hashlib
 import logging
@@ -13,7 +14,7 @@ import shutil
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -23,13 +24,13 @@ from curl_cffi.requests import AsyncSession
 from patchright.async_api import Error as BrowserError
 
 from video_crawler import tiktok
-from video_crawler.browser import Browsers, page_data, session_of
+from video_crawler.browser import Browsers, Session, page_data, session_of
 from video_crawler.crawl import retry_after_seconds
 from video_crawler.errors import Gone, Retry, Wait
-from video_crawler.identities import Identity, IdentityPool
+from video_crawler.identities import DownloadCredentials, Identity, IdentityPool
 from video_crawler.routes import proxy_reachable, proxy_url
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease, Scheduler
-from video_crawler.settings import SLOW_BYTES, SLOW_WINDOW
+from video_crawler.settings import RANGE_MIN_BYTES, RANGE_PARTS, SLOW_BYTES, SLOW_WINDOW
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ MEDIA_HOSTS = (
 )
 WAITING = {"proxy_down", "auth_failed", "throttled"}
 """这几种线路表现属于环境问题：等环境恢复，不算尝试次数。"""
+GENERIC_MEDIA = {"", "application/octet-stream", "binary/octet-stream"}
 
 
 class Stop(Exception):
@@ -68,10 +70,6 @@ class Stop(Exception):
         super().__init__(reason)
         self.reason, self.outcome, self.retry_after = reason, outcome, retry_after
         self.blocked, self.stale = blocked, stale
-
-
-class _Blocked(Retry):
-    """用当前身份重新取链后，媒体服务器仍然拒绝 token。"""
 
 
 class Skip(Exception):
@@ -113,6 +111,40 @@ class DownloadRate:
         return size // RATE_WINDOW_SECONDS
 
 
+class _Received:
+    """整条视频共享进度和低速窗口，分片的字节也计入同一个窗口。"""
+
+    def __init__(
+        self,
+        progress: DownloadProgress | None,
+        rate: DownloadRate | None,
+        slow_bytes: int,
+        slow_window: float,
+    ) -> None:
+        self.progress, self.rate = progress, rate
+        self.slow_bytes, self.slow_window = slow_bytes, slow_window
+        self.reset()
+
+    def reset(self, total: int | None = None) -> None:
+        self.size, self.window_bytes, self.window = 0, 0, time.monotonic()
+        if self.progress is not None:
+            self.progress.stage = "downloading"
+            self.progress.received_bytes, self.progress.total_bytes = 0, total or None
+
+    def record(self, size: int) -> None:
+        self.size += size
+        if self.progress is not None:
+            self.progress.received_bytes = self.size
+        now = time.monotonic()
+        if self.rate is not None:
+            self.rate.record(size, now)
+        self.window_bytes += size
+        if (elapsed := now - self.window) >= self.slow_window:
+            if self.window_bytes / elapsed < self.slow_bytes:
+                raise Broken("下载太慢")
+            self.window, self.window_bytes = now, 0
+
+
 class Downloader:
     def __init__(
         self,
@@ -124,11 +156,14 @@ class Downloader:
         media_cache: tiktok.MediaCache | None = None,
         slow_bytes: int = SLOW_BYTES,
         slow_window: float = SLOW_WINDOW,
+        range_parts: int = RANGE_PARTS,
+        range_min_bytes: int = RANGE_MIN_BYTES,
     ) -> None:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
         self._folder = folder
         self._media = media_cache or tiktok.MediaCache()
         self._slow_bytes, self._slow_window = slow_bytes, slow_window
+        self._range_parts, self._range_min_bytes = range_parts, range_min_bytes
         self._active: dict[str, DownloadProgress] = {}
         self._rate = DownloadRate()
         folder.mkdir(parents=True, exist_ok=True)
@@ -138,6 +173,14 @@ class Downloader:
 
     def download_speed(self) -> int:
         return self._rate.bytes_per_second(time.monotonic())
+
+    def has_cached_media(self, work_id: str | None = None) -> bool:
+        if work_id is None:
+            return self._media.has_usable(
+                lambda key: self._pool.download_credentials(key) is not None
+            )
+        cached = self._media.get(work_id)
+        return bool(cached and self._pool.download_credentials(cached.identity_id))
 
     async def __call__(self, task: ClaimedTask) -> None:
         """一次尝试；成功时视频已经上传，不另发事件。"""
@@ -158,26 +201,18 @@ class Downloader:
 
     async def _download(self, task: ClaimedTask, progress: DownloadProgress, path: Path) -> None:
         cached = self._media.get(progress.work_id)
-        identity = self._pool.take(preferred_id=cached.identity_id if cached else None)
-        result = "neutral"
-        try:
-            sha256 = None
-            if cached and identity.id == cached.identity_id:
-                sha256 = await self._fetch_media(
-                    task, identity, cached.urls, path, progress, cached=cached
-                )
-            if sha256 is None:
-                progress.stage, progress.received_bytes, progress.total_bytes = "preparing", 0, None
-                async with self._route(CRAWL, task) as lease:
-                    candidates = await self._address(lease, task, identity)
-                sha256 = await self._fetch_media(task, identity, candidates, path, progress)
-            assert sha256 is not None
-            result = "ok"
-        except _Blocked:
-            result = "blocked"
-            raise
-        finally:
-            self._pool.give_back(identity, result)
+        sha256 = None
+        if cached and (credentials := self._pool.download_credentials(cached.identity_id)):
+            sha256 = await self._fetch_media(
+                task, credentials, cached.identity_id, cached.urls, path, progress, cached=cached
+            )
+        if sha256 is None:
+            progress.stage, progress.received_bytes, progress.total_bytes = "preparing", 0, None
+            candidates, credentials, identity_id = await self._prepare(task)
+            sha256 = await self._fetch_media(
+                task, credentials, identity_id, candidates, path, progress
+            )
+        assert sha256 is not None
         progress.stage, progress.total_bytes = "uploading", progress.received_bytes
         try:
             status = await self._scheduler.upload(task, path, sha256)
@@ -187,6 +222,23 @@ class Downloader:
             raise Retry("上传后调度中心核对不上大小或 SHA-256")
         if status not in (204, 404, 409):  # 404、409：任务取消或已有新轮次，文件不要了
             raise Wait(30, f"上传返回 {status}", DOWNLOAD)
+
+    async def _prepare(self, task: ClaimedTask) -> tuple[list[str], DownloadCredentials, str]:
+        identity = await self._pool.take_for_download()
+        with ExitStack() as borrow:
+            borrow.callback(self._pool.give_back, identity, "neutral")
+            session = identity.session
+            assert session is not None
+            async with self._route(CRAWL, task) as lease:
+                try:
+                    candidates = await self._address(lease, task, identity, session)
+                    credentials = self._pool.download_credentials(identity.id)
+                    if credentials is None:
+                        raise Wait(10, "取链时身份会话失效")
+                    return candidates, credentials, identity.id
+                finally:
+                    # 浏览器已关闭，可以先释放身份，再等待采集租约归还。
+                    borrow.close()
 
     @asynccontextmanager
     async def _route(self, use: str, task: ClaimedTask) -> AsyncIterator[Lease]:
@@ -200,15 +252,15 @@ class Downloader:
             outcome, detail, retry_after = stop.outcome, stop.reason, stop.retry_after
             if outcome in WAITING:
                 raise Wait(retry_after or 60, detail, use) from None
-            error = _Blocked if stop.blocked else Retry
-            raise error(detail, lease.line) from None
+            raise Retry(detail, lease.line) from None
         finally:
             await self._scheduler.release(lease, outcome, detail, retry_after)
 
     async def _fetch_media(
         self,
         task: ClaimedTask,
-        identity: Identity,
+        credentials: DownloadCredentials,
+        identity_id: str,
         candidates: Sequence[str],
         path: Path,
         progress: DownloadProgress,
@@ -216,21 +268,32 @@ class Downloader:
         cached: tiktok.MediaLinks | None = None,
     ) -> str | None:
         async with self._route(DOWNLOAD, task) as lease:
-            blocked = False
+            blocked = succeeded = stale_cached = False
             try:
-                return await self._fetch(
-                    lease, identity, task.body["work"]["url"], candidates, path, progress
+                sha256 = await self._fetch(
+                    lease, credentials, task.body["work"]["url"], candidates, path, progress
                 )
+                succeeded = True
+                return sha256
             except Stop as stop:
+                blocked = stop.blocked
                 if cached and stop.stale:
+                    stale_cached = True
                     self._media.discard(progress.work_id, cached)
                     return None
-                blocked = stop.blocked
                 raise
             finally:
-                self._pool.note("download", not blocked)
+                if stale_cached:
+                    # 过期直链的 403 计入下载统计，身份是否被拒以重新取链的结果为准。
+                    self._pool.note("download", not blocked)
+                else:
+                    self._pool.record_download(
+                        identity_id, blocked=blocked, succeeded=succeeded, token=credentials[1]
+                    )
 
-    async def _address(self, lease: Lease, task: ClaimedTask, identity: Identity) -> list[str]:
+    async def _address(
+        self, lease: Lease, task: ClaimedTask, identity: Identity, session: Session
+    ) -> list[str]:
         """带身份 Cookie 走采集线路取地址，页面资料不足时用同线路打开 Chrome。"""
         work = task.body["work"]
         try:
@@ -240,8 +303,8 @@ class Downloader:
             ) as http:
                 response = await http.get(
                     work["url"],
-                    headers={"User-Agent": identity.session.user_agent},
-                    cookies=identity.session.cookies,
+                    headers={"User-Agent": session.user_agent},
+                    cookies=session.cookies,
                 )
             _check_address_status(response.status_code, response.headers.get("Retry-After"))
             if response.status_code == 200:
@@ -267,17 +330,18 @@ class Downloader:
     async def _fetch(
         self,
         lease: Lease,
-        identity: Identity,
+        credentials: DownloadCredentials,
         referer: str,
         candidates: Sequence[str],
         path: Path,
         progress: DownloadProgress,
     ) -> str:
         """依次试候选地址，最多传输 3 次；中途断开的同一地址再连一次。返回 SHA-256。"""
+        user_agent, token = credentials
         headers = {
-            "User-Agent": identity.session.user_agent,
+            "User-Agent": user_agent,
             "Referer": referer,
-            "Cookie": f"tt_chain_token={identity.session.token}",
+            "Cookie": f"tt_chain_token={token}",
             "Accept-Encoding": "identity",
         }
         proxy = await proxy_url(lease.route)
@@ -305,6 +369,8 @@ class Downloader:
                             rate=self._rate,
                             slow_bytes=self._slow_bytes,
                             slow_window=self._slow_window,
+                            range_parts=self._range_parts,
+                            range_min_bytes=self._range_min_bytes,
                         )
                     except Skip as error:
                         reason = str(error)
@@ -359,81 +425,179 @@ async def transfer(
     rate: DownloadRate | None = None,
     slow_bytes: int = SLOW_BYTES,
     slow_window: float = SLOW_WINDOW,
+    range_parts: int = RANGE_PARTS,
+    range_min_bytes: int = RANGE_MIN_BYTES,
 ) -> str:
-    """完整下载一次：只认 200 的视频响应，边写 .part 边算 SHA-256，核对长度后改名。"""
+    """完整下载一次，核对大小及 SHA-256 后再把临时文件改名。"""
     part = path.with_suffix(".part")
-    digest, size = hashlib.sha256(), 0
-    if progress is not None:
-        progress.stage, progress.received_bytes, progress.total_bytes = "downloading", 0, None
+    received = _Received(progress, rate, slow_bytes, slow_window)
+    digest = None
     try:
         async with client.stream("GET", url) as response:
-            status = response.status_code
-            if status in (401, 403):
-                raise Stop(f"视频服务器拒绝（{status}）", blocked=True, stale=status == 403)
-            if status == 407:
-                raise Stop("代理认证失败（407）", "auth_failed")
-            if status == 429:
-                retry_after = retry_after_seconds(response.headers.get("Retry-After"))
-                raise Stop("视频服务器限流（429）", "throttled", retry_after)
-            if status == 206:
-                raise Broken("收到部分内容（206）")
-            if status != 200:
-                raise Skip(f"视频服务器返回 {status}")
-            length = response.headers.get("Content-Length")
-            total = int(length) if length else None
-            if total is not None and total > MAX_BYTES:
-                raise Gone("文件超过 512 MiB 上限")
-            if total is None and "chunked" not in response.headers.get("Transfer-Encoding", ""):
-                raise Broken("响应没有可核对的长度")
-            if progress is not None and total is not None and total > 0:
-                progress.total_bytes = total
-            kind = response.headers.get("Content-Type", "").split(";")[0].strip()
-            window, window_bytes = time.monotonic(), 0
-            head = bytearray()
-            video = _video(kind, head)
-            with part.open("wb") as file:
-                async for chunk in response.aiter_raw():
-                    if not video:
-                        head.extend(chunk[: 8 - len(head)])
-                        if len(head) == 8:
-                            video = _video(kind, head)
-                            if not video:
-                                raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
-                    chunk_size = len(chunk)
-                    size += chunk_size
-                    if size > MAX_BYTES:
-                        raise Gone("文件超过 512 MiB 上限")
-                    file.write(chunk)
-                    digest.update(chunk)
-                    if progress is not None:
-                        progress.received_bytes = size
-                    received_at = time.monotonic()
-                    if rate is not None:
-                        rate.record(chunk_size, received_at)
-                    window_bytes += chunk_size
-                    if (elapsed := received_at - window) >= slow_window:
-                        if window_bytes / elapsed < slow_bytes:
-                            raise Broken("下载太慢")
-                        window, window_bytes = received_at, 0
-                file.flush()
-                os.fsync(file.fileno())
-        if not size or (total is not None and size != total):
-            raise Broken(f"收到 {size} 字节，声明 {length or '未知'}")
-        if not video:
-            raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
+            total, kind = _file_info(response)
+            if (
+                range_parts > 1
+                and total is not None
+                and total >= max(range_min_bytes, range_parts)
+                and any(
+                    unit.lower() == "bytes"
+                    for unit in response.headers.get_list("Accept-Ranges", split_commas=True)
+                )
+                and _identity_encoding(response)
+                and (kind.startswith("video/") or kind in GENERIC_MEDIA)
+            ):
+                range_url = response.url
+                etag = response.headers.get("ETag", "")
+            else:
+                digest = await _single(response, part, received, total, kind)
+        if digest is None:
+            assert total is not None
+            try:
+                digest = await _ranges(
+                    client, range_url, part, received, total, kind, range_parts, etag
+                )
+            except (Broken, Skip, httpx.HTTPError) as error:
+                log.debug("视频分片未完成，回退到单流：%s", type(error).__name__)
+                async with client.stream("GET", url) as response:
+                    digest = await _single(response, part, received, *_file_info(response))
         part.replace(path)
-        return digest.hexdigest()
+        return digest
     except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ReadError) as error:
         raise Broken(f"传输中途断开：{type(error).__name__}") from error
     finally:
         _remove_file(part)
 
 
+def _file_info(response: httpx.Response) -> tuple[int | None, str]:
+    status = response.status_code
+    if status in (401, 403):
+        raise Stop(f"视频服务器拒绝（{status}）", blocked=True, stale=status == 403)
+    if status == 407:
+        raise Stop("代理认证失败（407）", "auth_failed")
+    if status == 429:
+        retry_after = retry_after_seconds(response.headers.get("Retry-After"))
+        raise Stop("视频服务器限流（429）", "throttled", retry_after)
+    if status == 206:
+        raise Broken("收到部分内容（206）")
+    if status != 200:
+        raise Skip(f"视频服务器返回 {status}")
+    length = response.headers.get("Content-Length")
+    try:
+        total = int(length) if length is not None else None
+    except ValueError as error:
+        raise Broken("响应的文件长度无效") from error
+    if total is None and "chunked" not in response.headers.get("Transfer-Encoding", ""):
+        raise Broken("响应没有可核对的长度")
+    if total is not None and total < 0:
+        raise Broken("响应的文件长度无效")
+    if total is not None and total > MAX_BYTES:
+        raise Gone("文件超过 512 MiB 上限")
+    return total, response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+
+async def _single(
+    response: httpx.Response, part: Path, received: _Received, total: int | None, kind: str
+) -> str:
+    received.reset(total)
+    digest = hashlib.sha256()
+    head = bytearray()
+    video = _video(kind, head)
+    with part.open("wb") as file:
+        async for chunk in response.aiter_raw():
+            if not video:
+                head.extend(chunk[: 8 - len(head)])
+                if len(head) == 8:
+                    video = _video(kind, head)
+                    if not video:
+                        raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
+            if received.size + len(chunk) > MAX_BYTES:
+                raise Gone("文件超过 512 MiB 上限")
+            file.write(chunk)
+            digest.update(chunk)
+            received.record(len(chunk))
+        file.flush()
+        os.fsync(file.fileno())
+    if not received.size or (total is not None and received.size != total):
+        declared = total if total is not None else "未知"
+        raise Broken(f"收到 {received.size} 字节，声明 {declared}")
+    if not video:
+        raise Skip(f"返回的不是视频（{kind or '没有类型'}）")
+    return digest.hexdigest()
+
+
+def _identity_encoding(response: httpx.Response) -> bool:
+    return response.headers.get("Content-Encoding", "identity").lower() == "identity"
+
+
+async def _ranges(
+    client: httpx.AsyncClient,
+    url: httpx.URL,
+    part: Path,
+    received: _Received,
+    total: int,
+    kind: str,
+    count: int,
+    etag: str,
+) -> str:
+    received.reset(total)
+    with part.open("wb") as file:
+        file.truncate(total)
+    validator = {"If-Range": etag} if etag.startswith('"') else {}
+
+    async def fetch(start: int, end: int) -> None:
+        headers = validator | {"Range": f"bytes={start}-{end}"}
+        expected = end - start + 1
+        async with client.stream("GET", url, headers=headers) as response:
+            if response.status_code != 206:
+                raise Broken(f"分片返回 {response.status_code}")
+            if (
+                response.headers.get("Content-Range", "").lower() != f"bytes {start}-{end}/{total}"
+                or response.headers.get("Content-Length", str(expected)) != str(expected)
+                or (validator and response.headers.get("ETag", etag) != etag)
+                or not _identity_encoding(response)
+            ):
+                raise Broken("分片响应与原文件不符")
+            with part.open("r+b") as file:
+                file.seek(start)
+                size = 0
+                async for chunk in response.aiter_raw():
+                    size += len(chunk)
+                    if size > expected:
+                        raise Broken("分片超过声明的范围")
+                    file.write(chunk)
+                    received.record(len(chunk))
+            if size != expected:
+                raise Broken("分片未收完整")
+
+    jobs = [
+        asyncio.create_task(fetch(index * total // count, (index + 1) * total // count - 1))
+        for index in range(count)
+    ]
+    try:
+        await asyncio.gather(*jobs)
+    finally:
+        for job in jobs:
+            if not job.done():
+                job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+
+    digest = hashlib.sha256()
+    with part.open("r+b") as file:
+        if not _video(kind, file.read(8)):
+            raise Broken("分片拼接后没有有效的视频文件头")
+        file.seek(0)
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+            await asyncio.sleep(0)
+        os.fsync(file.fileno())
+    return digest.hexdigest()
+
+
 def _video(kind: str, head: bytes | bytearray) -> bool:
     """视频响应；通用二进制响应看文件头是不是 MP4。"""
     if kind.startswith("video/"):
         return True
-    return kind in ("", "application/octet-stream", "binary/octet-stream") and head[4:8] == b"ftyp"
+    return kind in GENERIC_MEDIA and head[4:8] == b"ftyp"
 
 
 async def trusted(request: httpx.Request) -> None:

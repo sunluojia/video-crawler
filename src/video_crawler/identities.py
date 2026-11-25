@@ -35,6 +35,8 @@ CHECK_EVERY = 12
 WARM_TIMEOUT = 45_000
 WARM_RETRY_AFTER = 60
 """同一资料预热失败后稍后再试，让其他资料先用预热名额。"""
+DOWNLOAD_IDENTITY_WAIT = 60
+"""待取链的下载等身份的上限，超时退回时不扣尝试。"""
 COUNTED_FAILS = 3
 """连续失败到这个数就不计入可用身份，后台先补一个新的。"""
 MAX_FACTOR = 2
@@ -44,6 +46,7 @@ COOLDOWN, MAX_COOLDOWN = 60, 30 * 60
 RECENT = 3600
 """账号池页面的比率按最近一小时算。"""
 IDENTITY_ID = re.compile(r"[0-9a-f]{12}")
+type DownloadCredentials = tuple[str, str]  # User-Agent, tt_chain_token
 
 
 @dataclass
@@ -92,6 +95,7 @@ class IdentityPool:
         self.identities: dict[str, Identity] = {}
         self._warming: dict[str, Identity] = {}
         self._wake = asyncio.Event()
+        self._available_changed = asyncio.Event()
         self._avoid: list[str] = []
         """上次预热失败的线路，下次避开。"""
         self._recent: deque[tuple[float, str, bool]] = deque()
@@ -240,33 +244,93 @@ class IdentityPool:
         identity.busy = True
         return identity
 
+    async def take_for_download(self) -> Identity:
+        """等正在取链或采集的身份释放。没有有效会话时，交回调度中心稍后重试。"""
+        try:
+            async with asyncio.timeout(DOWNLOAD_IDENTITY_WAIT):
+                while True:
+                    self._available_changed.clear()
+                    try:
+                        return self.take()
+                    except Wait:
+                        now = time.time()
+                        if not any(self._usable_session(i, now) for i in self.identities.values()):
+                            raise
+                    await self._available_changed.wait()
+        except TimeoutError:
+            raise Wait(10, "等待身份取链超时") from None
+
+    def download_credentials(self, identity_id: str) -> DownloadCredentials | None:
+        """读取可用会话，不占用资料目录。采集在进行时也可以复用同身份的缓存。"""
+        identity = self.identities.get(identity_id)
+        if identity is None or not self._usable_session(identity, time.time()):
+            return None
+        session = identity.session
+        assert session is not None and session.token
+        return session.user_agent, session.token
+
     def give_back(self, identity: Identity, result: str = "neutral") -> None:
         """用完归还。ok：成功，连续失败清零；blocked：下载被拒，冷却并作废 token；
         neutral：结果不怪身份（出口问题、内容本身的结论）。"""
         now = time.time()
         identity.busy, identity.last_used_at = False, now
-        if result == "ok":
+        self._available_changed.set()
+        if result == "blocked":
+            self._block(identity, now)
+        elif result == "ok" and identity.cooldown_until <= now:
             identity.fails = 0
-        elif result == "blocked":
-            identity.fails += 1
-            identity.cooldown_until = now + min(COOLDOWN * 2 ** (identity.fails - 1), MAX_COOLDOWN)
+        self._save_use(identity, now)
+
+    def record_download(
+        self, identity_id: str, *, blocked: bool, succeeded: bool = False, token: str | None = None
+    ) -> None:
+        """回记下载结果，保留该身份当前的借用状态。"""
+        self.note("download", not blocked)
+        identity = self.identities.get(identity_id)
+        if identity is None:
+            return
+        now = time.time()
+        if blocked:
+            self._block(identity, now, token)
+        elif (
+            succeeded
+            and identity.cooldown_until <= now
+            and identity.session is not None
+            and (token is None or identity.session.token == token)
+        ):
+            # 并发下载中的旧会话成功不能清掉新会话的失败次数。
+            identity.fails = 0
+        else:
+            return
+        self._save_use(identity, now)
+
+    def _block(self, identity: Identity, now: float, token: str | None = None) -> None:
+        identity.fails += 1
+        identity.cooldown_until = now + min(COOLDOWN * 2 ** (identity.fails - 1), MAX_COOLDOWN)
+        if token is None or (identity.session is not None and identity.session.token == token):
             identity.session = None
-            if identity.fails >= RETIRE_FAILS:
-                return self.retire(identity, f"下载连续 {identity.fails} 次被拒")
+        self._wake.set()
+        self._available_changed.set()
+
+    def _save_use(self, identity: Identity, now: float) -> None:
+        if identity.fails >= RETIRE_FAILS and not identity.busy:
+            return self.retire(identity, f"下载连续 {identity.fails} 次被拒")
         self._dirty[identity.id] = identity.record()
         if not identity.fresh(now, REFRESH_AFTER):
             self._wake.set()
 
     def refreshed(self, identity: Identity, session: Session) -> None:
         """用浏览器时顺带拿到了新的 Cookie。"""
-        if session.token:
-            identity.session, identity.warmed_at = session, time.time()
+        now = time.time()
+        if session.token and identity.cooldown_until <= now:
+            identity.session, identity.warmed_at = session, now
             identity.warm_retry_at = 0
 
     def refresh(self, identity: Identity) -> None:
         """账号池页面要求立即刷新：当作过期，后台循环下一个就预热它。"""
         identity.warmed_at = identity.warm_retry_at = 0
         self._wake.set()
+        self._available_changed.set()
 
     # ---- 后台补充和刷新 ----
 
@@ -318,7 +382,10 @@ class IdentityPool:
         finally:
             identity.busy = False
             self._warming.pop(identity.id)
-            if identity.id not in self.identities:
+            self._available_changed.set()
+            if identity.id in self.identities and identity.fails >= RETIRE_FAILS:
+                self._save_use(identity, time.time())
+            elif identity.id not in self.identities:
                 shutil.rmtree(self.profile(identity), ignore_errors=True)
         if retry_profile:
             identity.warm_retry_at = time.time() + WARM_RETRY_AFTER
@@ -410,3 +477,4 @@ class IdentityPool:
         self._retired.append(identity)
         log.info("身份 %s 退休：%s", identity.id, reason)
         self._wake.set()
+        self._available_changed.set()

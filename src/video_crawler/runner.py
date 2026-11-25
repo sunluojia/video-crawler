@@ -37,9 +37,11 @@ class Runner:
         *,
         available_identities: Callable[[], int],
         publish: Callable[[dict], Awaitable[None]],
+        cached_download: Callable[[str | None], bool] | None = None,
     ) -> None:
         self._scheduler, self._attempts, self._publish = scheduler, attempts, publish
         self._available_identities = available_identities
+        self._cached_download = cached_download
         self.slots = slots.copy()
         """每类并发由心跳下发，调小时进行中的做完为止。"""
         self.running: Jobs = {}
@@ -114,45 +116,42 @@ class Runner:
         for kind in kinds:
             self._claim_pause_until[kind] = max(until, self._claim_pause_until.get(kind, until))
 
-    @staticmethod
-    def _allocate(
-        capacity: dict[str, int], available: int, order: tuple[str, str]
-    ) -> dict[str, int]:
-        first, second = order
-        request = {
-            first: min(capacity.get(first, 0), (available + 1) // 2),
-            second: min(capacity.get(second, 0), available // 2),
-        }
-        spare = available - sum(request.values())
-        for kind in order:
-            extra = min(spare, capacity.get(kind, 0) - request[kind])
-            request[kind] += extra
-            spare -= extra
-        return {kind: count for kind, count in request.items() if count}
+    def _ready_capacity(self, available: int) -> dict[str, int]:
+        capacity = self._claim_capacity()
+        capacity[CRAWL_CREATOR] = min(capacity[CRAWL_CREATOR], available)
+        if (
+            capacity[DOWNLOAD_VIDEO]
+            and not available
+            and not (self._cached_download and self._cached_download(None))
+        ):
+            capacity[DOWNLOAD_VIDEO] = 0
+        return capacity
 
     async def _fill(self) -> None:
         available = self._available_identities()
-        if available <= 0:
+        capacity = self._ready_capacity(available)
+        if not any(capacity.values()):
             return
-        capacity = self._claim_capacity()
-        other = DOWNLOAD_VIDEO if self._preferred == CRAWL_CREATOR else CRAWL_CREATOR
-        order = (self._preferred, other)
-        request = self._allocate(capacity, available, order)
-        if not request:
-            return
-        if all(capacity.values()):
+        if available == 1 and all(capacity.values()):
+            # 单身份轮转取链和采集。轮到下载时可以领满下载槽，缺少直链的短暂等身份。
+            preferred = self._preferred
+            other = DOWNLOAD_VIDEO if preferred == CRAWL_CREATOR else CRAWL_CREATOR
             self._preferred = other
-        claimed = await self._claim(request)
-        spare = min(available - claimed.total(), self._available_identities())
-        if spare > 0:
-            # 某类没领满就把余量给另一类，单身份时首选为空也不用等下次轮询。
-            capacity = {
-                kind: slots
-                for kind, slots in self._claim_capacity().items()
-                if claimed[kind] >= request.get(kind, 0)
-            }
-            if request := self._allocate(capacity, spare, order):
-                await self._claim(request)
+            if (await self._claim({preferred: capacity[preferred]}))[preferred]:
+                return
+            if slots := self._ready_capacity(self._available_identities())[other]:
+                await self._claim({other: slots})
+            return
+
+        # 同轮认领两类时留出至少一个身份取链。下载队列为空便把这个身份交给采集。
+        reserved = capacity[DOWNLOAD_VIDEO] > 0 and capacity[CRAWL_CREATOR] == available > 1
+        if reserved:
+            capacity[CRAWL_CREATOR] -= 1
+        claimed = await self._claim({kind: slots for kind, slots in capacity.items() if slots})
+        if reserved and not claimed[DOWNLOAD_VIDEO] and claimed[CRAWL_CREATOR] == available - 1:
+            spare = min(available - claimed[CRAWL_CREATOR], self._available_identities())
+            if slots := self._ready_capacity(spare)[CRAWL_CREATOR]:
+                await self._claim({CRAWL_CREATOR: slots})
 
     async def _claim(self, kinds: dict[str, int]) -> Counter[str]:
         controls: set[tuple[str, str]] = set()
@@ -162,6 +161,7 @@ class Runner:
         finally:
             self._claim_controls = None
         capacity, available = self._capacity(), self._available_identities()
+        can_prepare = available > 0
         for task in claimed:
             if task.attempt_id in self.running or task.attempt_id in self._returning:
                 continue
@@ -173,8 +173,14 @@ class Runner:
                     continue
                 # 调度中心允许新认领时，以其批次状态为准，补上可能漏收的恢复通知。
                 self.paused_batches.discard(task.batch_id)
-            if not capacity.get(task.kind, 0) or available <= 0:
-                if available <= 0:
+                has_identity = available > 0
+            else:
+                work_id = task.body.get("work", {}).get("work_id")
+                has_identity = can_prepare or bool(
+                    self._cached_download and work_id is not None and self._cached_download(work_id)
+                )
+            if not capacity.get(task.kind, 0) or not has_identity:
+                if not has_identity:
                     self._pause_claims(CLAIM_RETRY_DELAY)
                 self._return(task, "本机身份或执行名额已变更")
                 continue
@@ -185,7 +191,8 @@ class Runner:
             self.running[task.attempt_id] = task, job
             job.add_done_callback(partial(self._finished, self.running, task))
             capacity[task.kind] -= 1
-            available -= 1
+            if task.kind == CRAWL_CREATOR:
+                available -= 1
         return Counter(task.kind for task in claimed)
 
     def _return(self, task: ClaimedTask, reason: str) -> None:

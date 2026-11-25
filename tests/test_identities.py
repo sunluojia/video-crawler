@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from video_crawler import identities
 from video_crawler.api import control_api
 from video_crawler.browser import Browsers, Session
+from video_crawler.errors import Wait
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.runner import Runner
 from video_crawler.scheduler import Lease, Scheduler
@@ -185,6 +186,37 @@ async def test_success_and_blocked_return_refill_without_waiting_for_poll(pool, 
         loop.cancel()
         with pytest.raises(asyncio.CancelledError):
             await loop
+
+
+def test_delayed_download_feedback_preserves_the_current_borrow_and_retirement(pool):
+    identity = add(pool, "shared", fails=identities.RETIRE_FAILS - 2)
+    token = identity.session.token
+    assert pool.take() is identity
+
+    pool.record_download(identity.id, blocked=True, token=token)
+    first_cooldown = identity.cooldown_until
+    pool.record_download(identity.id, blocked=True, token=token)
+    pool.record_download(identity.id, blocked=False, succeeded=True, token=token)
+
+    assert identity.busy and identity.session is None
+    assert identity.fails == identities.RETIRE_FAILS
+    assert identity.cooldown_until > first_cooldown
+    assert pool.profile(identity).is_dir()
+    pool.give_back(identity, "ok")
+    assert identity.id not in pool.identities and not pool.profile(identity).exists()
+
+    pool.record_download(identity.id, blocked=True, token=token)
+    snapshot = pool.snapshot()
+    assert (snapshot["download_total"], snapshot["download_blocked"]) == (4, 3)
+
+
+async def test_a_download_waiting_for_an_identity_times_out_as_a_resource_wait(pool, monkeypatch):
+    monkeypatch.setattr(identities, "DOWNLOAD_IDENTITY_WAIT", 0)
+    identity = add(pool, "busy")
+    assert pool.take() is identity
+    with pytest.raises(Wait, match="等待身份取链超时") as error:
+        await pool.take_for_download()
+    assert error.value.seconds == 10 and identity.busy
 
 
 async def test_failed_warm_gives_another_profile_a_chance(pool, monkeypatch):

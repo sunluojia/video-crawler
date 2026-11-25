@@ -175,6 +175,259 @@ async def test_a_complete_video_is_saved_with_its_sha256(tmp_path):
     assert not path.with_suffix(".part").exists()
 
 
+RANGE_VIDEO = MP4 + bytes(range(251)) * 4323
+MEDIA_URL = "https://v16.tiktokcdn.com/a"
+
+
+def requested_span(request: httpx.Request) -> tuple[int, int]:
+    start, end = request.headers["Range"].removeprefix("bytes=").split("-")
+    return int(start), int(end)
+
+
+@pytest.mark.parametrize("parts", [3, 4])
+async def test_range_transfers_run_concurrently_and_assemble_verified_bytes(
+    tmp_path, parts, monkeypatch
+):
+    spans = []
+    all_requested = asyncio.Event()
+    total = len(RANGE_VIDEO)
+    progress = download.DownloadProgress("task", "video")
+    now = 0.0
+    monkeypatch.setattr(download, "time", SimpleNamespace(monotonic=lambda: now))
+
+    async def handle(request):
+        if "Range" not in request.headers:
+
+            async def unread_body():
+                pytest.fail("The initial GET should only read headers before splitting")
+                yield b""
+
+            return httpx.Response(
+                200,
+                content=unread_body(),
+                headers={
+                    "Content-Length": str(total),
+                    "Accept-Ranges": "Bytes",
+                    "ETag": '"v1"',
+                },
+            )
+
+        assert request.headers["If-Range"] == '"v1"'
+        start, end = requested_span(request)
+        spans.append((start, end))
+        if len(spans) == parts:
+            all_requested.set()
+        await all_requested.wait()
+        assert progress.total_bytes == total
+
+        async def chunks():
+            nonlocal now
+            body = RANGE_VIDEO[start : end + 1]
+            if progress.received_bytes + len(body) == total:
+                # One shard alone falls below 20 KiB/s; the combined transfer stays above it.
+                now = 45.0
+            yield body
+
+        return httpx.Response(
+            206, content=chunks(), headers={"Content-Range": f"bytes {start}-{end}/{total}"}
+        )
+
+    path = tmp_path / "video.mp4"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        digest = await asyncio.wait_for(
+            download.transfer(client, MEDIA_URL, path, progress, range_parts=parts), 2
+        )
+
+    assert sorted(spans) == [
+        (i * total // parts, (i + 1) * total // parts - 1) for i in range(parts)
+    ]
+    assert progress.received_bytes == total
+    assert digest == hashlib.sha256(RANGE_VIDEO).hexdigest()
+    assert path.read_bytes() == RANGE_VIDEO
+    assert not path.with_suffix(".part").exists()
+
+
+async def test_a_full_stream_403_after_range_rejection_still_reports_a_block(tmp_path):
+    full_requests = 0
+
+    async def handle(request):
+        nonlocal full_requests
+        if "Range" not in request.headers:
+            full_requests += 1
+            if full_requests == 1:
+                return streamed(200, MP4, Accept_Ranges="bytes")
+        return streamed(403)
+
+    path = tmp_path / "video.mp4"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        with pytest.raises(Stop, match="403") as error:
+            await download.transfer(client, MEDIA_URL, path, range_min_bytes=1)
+
+    assert error.value.blocked and full_requests == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "200",
+        "403",
+        "429",
+        "wrong-range",
+        "short",
+        "too-long",
+        "changed-etag",
+        "encoded",
+        "disconnect",
+    ],
+)
+async def test_range_failure_retries_with_a_clean_single_stream(tmp_path, problem):
+    progress = download.DownloadProgress("task", "video")
+    full_requests = 0
+    cancelled = asyncio.Event()
+    another_started = asyncio.Event()
+    ranges_started = 0
+    total = len(MP4)
+
+    async def handle(request):
+        nonlocal full_requests, ranges_started
+        if "Range" not in request.headers:
+            full_requests += 1
+            if full_requests == 2:
+                assert cancelled.is_set()
+                return streamed(200, MP4, Content_Type="video/mp4")
+            return streamed(200, MP4, Accept_Ranges="bytes", ETag='"v1"')
+
+        ranges_started += 1
+        start, end = requested_span(request)
+        body = MP4[start : end + 1]
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Content-Length": str(len(body)),
+        }
+        if start != 0:
+
+            async def unfinished():
+                try:
+                    yield body[:1]
+                    another_started.set()
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+
+            return httpx.Response(206, content=unfinished(), headers=headers)
+
+        await another_started.wait()
+        if problem.isdigit():
+            return streamed(int(problem), body)
+        if problem == "wrong-range":
+            headers["Content-Range"] = f"bytes {start + 1}-{end + 1}/{total}"
+        if problem == "changed-etag":
+            headers["ETag"] = '"v2"'
+        if problem == "encoded":
+            headers["Content-Encoding"] = "gzip"
+
+        async def faulty():
+            if problem == "short":
+                yield body[:-1]
+            elif problem == "too-long":
+                yield body + b"!"
+            else:
+                yield body
+            if problem == "disconnect":
+                raise httpx.ReadError("remote closed")
+
+        return httpx.Response(206, content=faulty(), headers=headers)
+
+    path = tmp_path / "video.mp4"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        digest = await asyncio.wait_for(
+            download.transfer(client, MEDIA_URL, path, progress, range_parts=2, range_min_bytes=1),
+            2,
+        )
+
+    assert (full_requests, ranges_started) == (2, 2)
+    assert (progress.received_bytes, progress.total_bytes) == (total, total)
+    assert digest == hashlib.sha256(MP4).hexdigest()
+    assert path.read_bytes() == MP4
+    assert not path.with_suffix(".part").exists()
+
+
+@pytest.mark.parametrize(
+    ("accept_ranges", "options"),
+    [
+        ("none", {"range_min_bytes": 1}),
+        ("bytes", {"range_min_bytes": len(MP4) + 1}),
+        ("bytes", {"range_min_bytes": 1, "range_parts": 1}),
+    ],
+    ids=["unsupported", "below-threshold", "disabled"],
+)
+async def test_single_stream_does_not_probe_when_range_is_ineligible(
+    tmp_path, accept_ranges, options
+):
+    requests = []
+
+    async def handle(request):
+        requests.append(request)
+        return streamed(200, MP4, Accept_Ranges=accept_ranges)
+
+    path = tmp_path / "video.mp4"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        assert (
+            await download.transfer(client, MEDIA_URL, path, **options)
+            == hashlib.sha256(MP4).hexdigest()
+        )
+    [request] = requests
+    assert "Range" not in request.headers
+    assert path.read_bytes() == MP4
+
+
+async def test_cancellation_closes_all_ranges_and_cleans_the_part_file(tmp_path):
+    ranges_started, ranges_closed = [], []
+    all_started = asyncio.Event()
+    full_requests = 0
+
+    async def handle(request):
+        nonlocal full_requests
+        if "Range" not in request.headers:
+            full_requests += 1
+            return streamed(200, MP4, Accept_Ranges="bytes")
+        start, end = requested_span(request)
+
+        async def unfinished():
+            try:
+                yield MP4[start : start + 1]
+                ranges_started.append(start)
+                if len(ranges_started) == 4:
+                    all_started.set()
+                await asyncio.Future()
+            finally:
+                ranges_closed.append(start)
+
+        return httpx.Response(
+            206,
+            content=unfinished(),
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(MP4)}",
+            },
+        )
+
+    path = tmp_path / "video.mp4"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        job = asyncio.create_task(download.transfer(client, MEDIA_URL, path, range_min_bytes=1))
+        try:
+            await asyncio.wait_for(all_started.wait(), 1)
+            assert path.with_suffix(".part").is_file()
+        finally:
+            job.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await job
+
+    assert full_requests == 1
+    assert sorted(ranges_closed) == sorted(ranges_started)
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("rate", "minimum", "accepted"), [(60, 20, True), (10, 20, False), (10, 8, True)]
 )

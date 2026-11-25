@@ -7,6 +7,7 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SLOW_BYTES, SLOW_WINDOW = 20 * 1024, 45
+RANGE_PARTS, RANGE_MIN_BYTES = 4, 1024 * 1024
 
 
 class Settings(BaseSettings):
@@ -30,6 +31,10 @@ class Settings(BaseSettings):
     """下载断开阈值，单位是字节每秒。"""
     download_slow_window: float = Field(default=SLOW_WINDOW, gt=0, allow_inf_nan=False)
     """慢速下载的统计窗口和无数据读取超时，单位是秒。"""
+    download_range_parts: int = Field(default=RANGE_PARTS, ge=1, le=4)
+    """并发 HTTP Range 分片数，设为 1 时使用单流。"""
+    download_range_min_bytes: int = Field(default=RANGE_MIN_BYTES, gt=0)
+    """至少多少字节才试分片。"""
     chrome_channel: str = "chrome"
     warm_headless: bool = True
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到

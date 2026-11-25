@@ -13,6 +13,7 @@ import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from video_crawler import runner as runner_module
+from video_crawler import tiktok
 from video_crawler.api import control_api
 from video_crawler.browser import Browsers, Session
 from video_crawler.download import Downloader
@@ -20,7 +21,7 @@ from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.main import heartbeat, publish_event
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
-from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask
+from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease
 from video_crawler.settings import Settings
 
 SLOTS = {CRAWL_CREATOR: 2, DOWNLOAD_VIDEO: 4}
@@ -29,7 +30,15 @@ TOKEN = "t" * 16
 
 def task(kind=DOWNLOAD_VIDEO, task_id="t1", batch_id="b1", **fields) -> ClaimedTask:
     return ClaimedTask(
-        task_id, 1, kind, str(uuid4()), {"batch_id": batch_id, "work": {"work_id": "7"}}, **fields
+        task_id,
+        1,
+        kind,
+        str(uuid4()),
+        {
+            "batch_id": batch_id,
+            "work": {"work_id": "7", "url": "https://www.tiktok.com/@a/video/7"},
+        },
+        **fields,
     )
 
 
@@ -53,13 +62,16 @@ def server(*tasks) -> SimpleNamespace:
     )
 
 
-def run_with(scheduler, handler, *, slots=SLOTS, available=lambda: 1, publish=None) -> Runner:
+def run_with(
+    scheduler, handler, *, slots=SLOTS, available=lambda: 1, publish=None, cached_download=None
+) -> Runner:
     return Runner(
         scheduler,
         {CRAWL_CREATOR: handler, DOWNLOAD_VIDEO: handler},
         slots,
         available_identities=available,
         publish=publish or AsyncMock(),
+        cached_download=cached_download,
     )
 
 
@@ -164,7 +176,7 @@ async def test_shared_wait_pauses_both_claims_until_deadline(claim_clock, kind, 
         claim_clock.return_value += 1
         await runner._fill()
         await asyncio.gather(*runner.jobs())
-        assert scheduler.claim.await_args.args == ({CRAWL_CREATOR: 1, DOWNLOAD_VIDEO: 1},)
+        assert scheduler.claim.await_args.args == ({CRAWL_CREATOR: 1, DOWNLOAD_VIDEO: 4},)
         assert handler.await_args_list == [call(blocked), call(crawl), call(download)]
     finally:
         await cancel_jobs(runner)
@@ -234,7 +246,7 @@ async def test_wait_during_claim_blocks_the_fallback_claim(claim_clock):
         may_reply.set()
         await asyncio.wait_for(in_transit, 1)
         assert scheduler.claim.await_args_list == [
-            call({DOWNLOAD_VIDEO: 1}),
+            call({DOWNLOAD_VIDEO: 2}),
             call({CRAWL_CREATOR: 1}),
         ]
     finally:
@@ -320,24 +332,27 @@ async def test_five_failed_downloads_pause_the_device():
 
 
 async def test_one_idle_identity_alternates_between_crawl_and_download():
-    pending = [
-        task(kind, f"{kind}-{index}")
-        for kind in (CRAWL_CREATOR, DOWNLOAD_VIDEO)
-        for index in range(8)
-    ]
-    scheduler = server(*pending)
+    scheduler = server(
+        *(task(CRAWL_CREATOR, f"crawl-{i}") for i in range(4)),
+        *(task(DOWNLOAD_VIDEO, f"download-{i}") for i in range(16)),
+    )
     handler = AsyncMock(return_value=None)
     runner = run_with(scheduler, handler)
 
-    for _ in pending:
+    for count in (1, 4) * 4:
         await runner._fill()
-        [running] = runner.jobs()
-        await running
+        assert len(runner.jobs()) == count
+        await asyncio.gather(*runner.jobs())
     assert [entry.args[0].kind for entry in handler.await_args_list] == [
         CRAWL_CREATOR,
         DOWNLOAD_VIDEO,
-    ] * 8
-    assert all(sum(entry.args[0].values()) == 1 for entry in scheduler.claim.await_args_list)
+        DOWNLOAD_VIDEO,
+        DOWNLOAD_VIDEO,
+        DOWNLOAD_VIDEO,
+    ] * 4
+    assert (
+        scheduler.claim.await_args_list == [call({CRAWL_CREATOR: 1}), call({DOWNLOAD_VIDEO: 4})] * 4
+    )
 
 
 async def test_one_identity_claims_from_the_other_kind_when_preferred_kind_is_empty():
@@ -347,39 +362,118 @@ async def test_one_identity_claims_from_the_other_kind_when_preferred_kind_is_em
     await asyncio.gather(*runner.jobs())
     assert [entry.args[0] for entry in scheduler.claim.await_args_list] == [
         {CRAWL_CREATOR: 1},
-        {DOWNLOAD_VIDEO: 1},
+        {DOWNLOAD_VIDEO: 4},
     ]
 
 
-async def test_runner_respects_both_slot_limits_and_idle_identity_count():
-    available = 2
-    started = asyncio.Queue()
-
-    async def handler(current):
-        nonlocal available
-        available -= 1
-        started.put_nowait(current.kind)
-        await asyncio.Future()
-
+async def test_runner_pipelines_more_transfers_than_identities_and_allows_crawl(
+    tmp_path, monkeypatch
+):
     scheduler = server(
-        *(task(CRAWL_CREATOR, f"crawl-{i}") for i in range(3)),
-        *(task(DOWNLOAD_VIDEO, f"download-{i}") for i in range(3)),
+        *(task(CRAWL_CREATOR, f"crawl-{i}") for i in range(2)),
+        *(task(DOWNLOAD_VIDEO, f"download-{i}") for i in range(4)),
     )
-    runner = run_with(
-        scheduler, handler, slots={CRAWL_CREATOR: 1, DOWNLOAD_VIDEO: 2}, available=lambda: available
+    scheduler.lease = AsyncMock(return_value=Lease("lease", "route", {"kind": "direct"}))
+    scheduler.release = AsyncMock()
+    scheduler.upload = AsyncMock(return_value=204)
+    browsers = Browsers("chrome")
+    pool = IdentityPool(
+        Settings(service_token=TOKEN, profile_root=tmp_path), Mock(), scheduler, browsers
     )
-    loop = asyncio.create_task(runner.run())
+    identity = Identity(
+        "ready",
+        browser="157",
+        warmed_at=time.time(),
+        session=Session({"tt_chain_token": "test-token"}, "ua", "157"),
+    )
+    pool.browser = identity.browser
+    pool.identities[identity.id] = identity
+    downloader = Downloader(pool, scheduler, browsers, tmp_path / "videos")
+    lookup, transfer, crawl = asyncio.Queue(), asyncio.Queue(), asyncio.Event()
+    may_resolve, may_finish = asyncio.Event(), asyncio.Event()
+
+    async def address(_, current, borrowed, session):
+        assert borrowed is identity and identity.busy and session is identity.session
+        lookup.put_nowait(current.task_id)
+        await may_resolve.wait()
+        return ["https://v16.tiktokcdn.com/video"]
+
+    async def fetch(_, credentials, referer, candidates, path, progress):
+        assert credentials == ("ua", "test-token")
+        transfer.put_nowait(progress.task_id)
+        await may_finish.wait()
+        return "digest"
+
+    async def collect(_):
+        assert pool.take() is identity
+        try:
+            crawl.set()
+            await may_finish.wait()
+        finally:
+            pool.give_back(identity)
+
+    monkeypatch.setattr("video_crawler.download.MIN_FREE", 0)
+    monkeypatch.setattr(downloader, "_address", address)
+    monkeypatch.setattr(downloader, "_fetch", fetch)
+    runner = Runner(
+        scheduler,
+        {DOWNLOAD_VIDEO: downloader, CRAWL_CREATOR: collect},
+        {DOWNLOAD_VIDEO: 3},
+        available_identities=lambda: len(pool.available()),
+        publish=AsyncMock(),
+    )
+
+    await runner._fill()
     try:
-        assert await asyncio.wait_for(started.get(), 1) == CRAWL_CREATOR
-        assert await asyncio.wait_for(started.get(), 1) == DOWNLOAD_VIDEO
-        assert scheduler.claim.await_count == 1
-        assert available == 0
-        available += 1
-        runner.wake()
-        assert await asyncio.wait_for(started.get(), 1) == DOWNLOAD_VIDEO
-        assert len(runner.running) == 3 and available == 0
+        assert await asyncio.wait_for(lookup.get(), 1) == "download-0"
+        assert lookup.empty() and identity.busy
+        scheduler.claim.assert_awaited_once_with({DOWNLOAD_VIDEO: 3})
+        assert runner.busy(DOWNLOAD_VIDEO) == 3
+        may_resolve.set()
+        transferring = {await asyncio.wait_for(transfer.get(), 1) for _ in range(3)}
+        assert transferring == {"download-0", "download-1", "download-2"}
+        assert pool.available() == [identity]
+
+        runner.slots[CRAWL_CREATOR] = 2
+        await runner._fill()
+        await asyncio.wait_for(crawl.wait(), 1)
+        assert runner.busy(DOWNLOAD_VIDEO) == 3 and runner.busy(CRAWL_CREATOR) == 1
+        assert identity.busy
+        assert scheduler.claim.await_args_list == [
+            call({DOWNLOAD_VIDEO: 3}),
+            call({CRAWL_CREATOR: 1}),
+        ]
+        may_finish.set()
+        await asyncio.gather(*runner.jobs())
+        scheduler.defer.assert_not_awaited()
+        assert scheduler.upload.await_count == 3
     finally:
-        await cancel_jobs(runner, loop)
+        await cancel_jobs(runner)
+
+
+async def test_available_cache_lets_runner_claim_with_no_idle_identity():
+    cached = task(task_id="cached")
+    uncached = task(task_id="uncached")
+    uncached.body["work"]["work_id"] = "8"
+    scheduler = server(task(CRAWL_CREATOR, "crawl"), cached, uncached)
+    handler = AsyncMock(return_value=None)
+    cache = tiktok.MediaCache()
+    cache.remember("busy-profile", "7", ["https://v16.tiktokcdn.com/video"])
+
+    def cached_download(work_id):
+        return (
+            cache.has_usable(lambda _: True) if work_id is None else cache.get(work_id) is not None
+        )
+
+    runner = run_with(scheduler, handler, available=lambda: 0, cached_download=cached_download)
+    await runner._fill()
+    await asyncio.gather(*runner.jobs())
+
+    scheduler.claim.assert_awaited_once_with({DOWNLOAD_VIDEO: 4})
+    handler.assert_awaited_once_with(cached)
+    scheduler.defer.assert_awaited_once_with(
+        uncached.attempt_id, 1, "本机身份或执行名额已变更", False, None
+    )
 
 
 async def test_heartbeat_changes_slots_and_cancels_the_revoked_attempt():

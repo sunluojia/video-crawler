@@ -142,7 +142,7 @@ class Downloader:
     async def __call__(self, task: ClaimedTask) -> None:
         """一次尝试；成功时视频已经上传，不另发事件。"""
         if shutil.disk_usage(self._folder).free < MIN_FREE:
-            raise Wait(60, "磁盘空间不足")
+            raise Wait(60, "磁盘空间不足", DOWNLOAD)
         path = self._folder / f"{task.task_id}-{task.run}-{task.attempt_id}.mp4"
         progress = DownloadProgress(task.task_id, task.body["work"]["work_id"])
         self._active[task.attempt_id] = progress
@@ -151,7 +151,7 @@ class Downloader:
         except OSError as error:
             if error.errno != errno.ENOSPC:
                 raise
-            raise Wait(60, "磁盘空间不足") from error
+            raise Wait(60, "磁盘空间不足", DOWNLOAD) from error
         finally:
             self._active.pop(task.attempt_id, None)
             _remove_file(path)
@@ -186,7 +186,7 @@ class Downloader:
         if status == 422:
             raise Retry("上传后调度中心核对不上大小或 SHA-256")
         if status not in (204, 404, 409):  # 404、409：任务取消或已有新轮次，文件不要了
-            raise Wait(30, f"上传返回 {status}")
+            raise Wait(30, f"上传返回 {status}", DOWNLOAD)
 
     @asynccontextmanager
     async def _route(self, use: str, task: ClaimedTask) -> AsyncIterator[Lease]:

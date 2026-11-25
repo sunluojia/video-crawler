@@ -8,7 +8,7 @@ class Wait(Exception):
         super().__init__(reason)
         self.seconds, self.reason = seconds, reason
         self.use = use
-        """在等哪个用途的线路（如果已知）。"""
+        """受等待影响的用途。未指定时表示两类任务共用的环境。"""
 
 
 class Retry(Exception):

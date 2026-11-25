@@ -1,5 +1,6 @@
 import json
 from contextlib import asynccontextmanager
+from errno import ENOSPC
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
@@ -142,6 +143,21 @@ async def test_download_does_not_request_a_line_without_an_identity(attempt):
     with pytest.raises(Wait, match="没有可用身份"):
         await attempt.run(attempt.task)
     attempt.scheduler.lease.assert_not_awaited()
+    assert not attempt.run.progress()
+
+
+@pytest.mark.parametrize("write_failed", [False, True], ids=["pre-check", "write-failed"])
+async def test_disk_full_wait_is_scoped_to_downloads(attempt, monkeypatch, write_failed):
+    if write_failed:
+        attempt.outcomes[FRESH] = OSError(ENOSPC, "disk full")
+    else:
+        monkeypatch.setattr(download, "MIN_FREE", 1)
+        monkeypatch.setattr(download.shutil, "disk_usage", lambda _: SimpleNamespace(free=0))
+
+    with pytest.raises(Wait, match="磁盘空间不足") as failure:
+        await attempt.run(attempt.task)
+    assert (failure.value.use, failure.value.seconds) == (DOWNLOAD, 60)
+    attempt.scheduler.upload.assert_not_awaited()
     assert not attempt.run.progress()
 
 

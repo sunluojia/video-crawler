@@ -15,7 +15,7 @@ import httpx
 from redis.exceptions import RedisError
 
 from video_crawler.errors import Gone, Retry, Wait
-from video_crawler.scheduler import ClaimedTask, Scheduler
+from video_crawler.scheduler import DOWNLOAD, ClaimedTask, Scheduler
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ MAX_ATTEMPTS = 3
 BACKOFF = (60, 300)
 LIMITS = {CRAWL_CREATOR: 120, DOWNLOAD_VIDEO: 600}
 PAUSE_AFTER, MAX_PAUSE = 5, 600
+CLAIM_RETRY_DELAY, MAX_CLAIM_PAUSE = 5, 15
 type Jobs = dict[str, tuple[ClaimedTask, asyncio.Task[None]]]
 
 
@@ -46,6 +47,7 @@ class Runner:
         self._stopping: set[asyncio.Task] = set()
         self.paused_batches: set[str] = set()
         self._claim_controls: set[tuple[str, str]] | None = None
+        self._claim_pause_until: dict[str, float] = {}
         self._preferred = CRAWL_CREATOR
         self._streak = 0
         self.paused_until = 0.0
@@ -60,6 +62,7 @@ class Runner:
             try:
                 await self._fill()
             except httpx.HTTPError as error:
+                self._pause_claims(CLAIM_RETRY_DELAY)
                 log.warning("认领任务失败，稍后重试：%s", error)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), 1)
@@ -96,6 +99,21 @@ class Runner:
             DOWNLOAD_VIDEO: max(download_slots, 0),
         }
 
+    def _claim_capacity(self) -> dict[str, int]:
+        capacity = self._capacity()
+        now = time.monotonic()
+        for kind, until in self._claim_pause_until.items():
+            if until > now:
+                capacity[kind] = 0
+        return capacity
+
+    def _pause_claims(self, retry_after: float, use: str | None = None) -> None:
+        until = time.monotonic() + min(retry_after, MAX_CLAIM_PAUSE)
+        # 下载取链也用采集线路，身份池和调度中心则由两类任务共用。
+        kinds = (DOWNLOAD_VIDEO,) if use == DOWNLOAD else (CRAWL_CREATOR, DOWNLOAD_VIDEO)
+        for kind in kinds:
+            self._claim_pause_until[kind] = max(until, self._claim_pause_until.get(kind, until))
+
     @staticmethod
     def _allocate(
         capacity: dict[str, int], available: int, order: tuple[str, str]
@@ -116,7 +134,7 @@ class Runner:
         available = self._available_identities()
         if available <= 0:
             return
-        capacity = self._capacity()
+        capacity = self._claim_capacity()
         other = DOWNLOAD_VIDEO if self._preferred == CRAWL_CREATOR else CRAWL_CREATOR
         order = (self._preferred, other)
         request = self._allocate(capacity, available, order)
@@ -130,7 +148,7 @@ class Runner:
             # 某类没领满就把余量给另一类，单身份时首选为空也不用等下次轮询。
             capacity = {
                 kind: slots
-                for kind, slots in self._capacity().items()
+                for kind, slots in self._claim_capacity().items()
                 if claimed[kind] >= request.get(kind, 0)
             }
             if request := self._allocate(capacity, spare, order):
@@ -156,6 +174,8 @@ class Runner:
                 # 调度中心允许新认领时，以其批次状态为准，补上可能漏收的恢复通知。
                 self.paused_batches.discard(task.batch_id)
             if not capacity.get(task.kind, 0) or available <= 0:
+                if available <= 0:
+                    self._pause_claims(CLAIM_RETRY_DELAY)
                 self._return(task, "本机身份或执行名额已变更")
                 continue
             for previous, job in self.running.values():
@@ -237,7 +257,9 @@ class Runner:
             if asyncio.current_task() in self._stopping:
                 raise asyncio.CancelledError from error
             if isinstance(error, Wait):
-                await self._defer(task, error.seconds, error.reason)
+                retry_after = max(error.seconds, 1)
+                self._pause_claims(retry_after, error.use)
+                await self._defer(task, retry_after, error.reason)
                 return None
             if isinstance(error, Gone):
                 log.info("%s %s 结束：%s", task.kind, task.task_id, error)

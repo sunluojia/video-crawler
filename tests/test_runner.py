@@ -5,10 +5,11 @@ import time
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 from uuid import uuid4
 
 import httpx
+import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from video_crawler import runner as runner_module
@@ -19,7 +20,7 @@ from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
 from video_crawler.main import heartbeat, publish_event
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
-from video_crawler.scheduler import CRAWL, ClaimedTask
+from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask
 from video_crawler.settings import Settings
 
 SLOTS = {CRAWL_CREATOR: 2, DOWNLOAD_VIDEO: 4}
@@ -74,6 +75,13 @@ def events(publish):
     return [entry.args[0] for entry in publish.await_args_list]
 
 
+@pytest.fixture
+def claim_clock(monkeypatch):
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(runner_module, "time", SimpleNamespace(monotonic=clock, time=time.time))
+    return clock
+
+
 async def test_business_retries_use_server_history_and_avoid_failed_lines():
     scheduler, publish = server(), AsyncMock()
     reason = "视频服务器拒绝（403）"
@@ -111,21 +119,186 @@ async def test_a_failed_crawl_reports_the_profile_it_read():
     assert (final["conclusion"], final["profile"]) == ("failed", {"handle": "bob"})
 
 
-async def test_wait_does_not_consume_a_business_attempt_or_block_other_batches():
-    download = task()
-    crawl = task(CRAWL_CREATOR, "t2", "other-batch")
-    reason = "没有采集线路：线路都在冷却或限流"
-    scheduler = server(download, crawl)
-    handler = AsyncMock(side_effect=[Wait(30, reason, CRAWL), {"conclusion": "ok"}])
-    runner = run_with(scheduler, handler, slots={CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 1})
+@pytest.mark.parametrize(
+    ("kind", "wait", "pause"),
+    [
+        (CRAWL_CREATOR, Wait(30, "没有采集线路：并发已满", CRAWL), 15),
+        (DOWNLOAD_VIDEO, Wait(30, "没有采集线路：线路都在冷却或限流", CRAWL), 15),
+        (CRAWL_CREATOR, Wait(10, "没有可用身份"), 10),
+        (DOWNLOAD_VIDEO, Wait(30, "调度中心连不上"), 15),
+    ],
+    ids=["crawl-capacity", "crawl-cooldown", "no-identity", "scheduler-unreachable"],
+)
+async def test_shared_wait_pauses_both_claims_until_deadline(claim_clock, kind, wait, pause):
+    blocked = task(kind, "blocked")
+    crawl = task(CRAWL_CREATOR, "crawl", "other-batch")
+    download = task(DOWNLOAD_VIDEO, "download", "other-batch")
+    returning, may_return = asyncio.Event(), asyncio.Event()
+
+    async def defer(*_):
+        returning.set()
+        await may_return.wait()
+
+    scheduler = server(blocked, crawl, download)
+    scheduler.defer.side_effect = defer
+    handler = AsyncMock(side_effect=[wait, None, None])
+    runner = run_with(scheduler, handler, slots={kind: 1}, available=lambda: 2)
+    await runner._fill()
+    try:
+        [job] = runner.jobs()
+        await asyncio.wait_for(returning.wait(), 1)
+        runner.slots.update(SLOTS)
+        await runner._fill()
+        scheduler.claim.assert_awaited_once_with({kind: 1})
+
+        may_return.set()
+        await job
+        scheduler.defer.assert_awaited_once_with(
+            blocked.attempt_id, wait.seconds, wait.reason, False, None
+        )
+        for _ in range(1, pause):
+            claim_clock.return_value += 1
+            await runner._fill()
+        scheduler.claim.assert_awaited_once()
+
+        claim_clock.return_value += 1
+        await runner._fill()
+        await asyncio.gather(*runner.jobs())
+        assert scheduler.claim.await_args.args == ({CRAWL_CREATOR: 1, DOWNLOAD_VIDEO: 1},)
+        assert handler.await_args_list == [call(blocked), call(crawl), call(download)]
+    finally:
+        await cancel_jobs(runner)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "reason", "pause"),
+    [
+        (30, "没有下载线路：并发已满", 15),
+        (60, "磁盘空间不足", 15),
+        (0, "没有下载线路：线路都在冷却或限流", 1),
+    ],
+    ids=["download-line", "disk-full", "zero-retry-after"],
+)
+async def test_download_wait_pauses_only_download_claims(claim_clock, seconds, reason, pause):
+    blocked = task(task_id="blocked")
+    download = task(task_id="download")
+    crawl = task(CRAWL_CREATOR, "crawl")
+    scheduler = server(blocked, download, crawl)
+    handler = AsyncMock(side_effect=[Wait(seconds, reason, DOWNLOAD), None, None])
+    runner = run_with(scheduler, handler, slots={DOWNLOAD_VIDEO: 1})
     await runner._fill()
     await asyncio.gather(*runner.jobs())
-    scheduler.defer.assert_awaited_once_with(download.attempt_id, 30, reason, False, None)
+    scheduler.defer.assert_awaited_once_with(
+        blocked.attempt_id, max(seconds, 1), reason, False, None
+    )
 
     runner.slots[CRAWL_CREATOR] = 1
+    deadline = claim_clock.return_value + pause
+    claim_clock.return_value = deadline - 0.1
     await runner._fill()
     await asyncio.gather(*runner.jobs())
-    assert handler.await_args.args == (crawl,)
+    assert scheduler.claim.await_args_list == [call({DOWNLOAD_VIDEO: 1}), call({CRAWL_CREATOR: 1})]
+    assert handler.await_args_list == [call(blocked), call(crawl)]
+
+    claim_clock.return_value = deadline
+    await runner._fill()
+    await asyncio.gather(*runner.jobs())
+    assert scheduler.claim.await_args.args == ({DOWNLOAD_VIDEO: 1},)
+    assert handler.await_args_list == [call(blocked), call(crawl), call(download)]
+
+
+async def test_wait_during_claim_blocks_the_fallback_claim(claim_clock):
+    blocked = task()
+    wait_now, claiming, may_reply = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def handler(_):
+        await wait_now.wait()
+        raise Wait(30, "没有下载线路：并发已满", DOWNLOAD)
+
+    async def claim(_):
+        claiming.set()
+        await may_reply.wait()
+        return []
+
+    scheduler = server(blocked)
+    runner = run_with(scheduler, handler, slots={DOWNLOAD_VIDEO: 2})
+    await runner._fill()
+    [job] = runner.jobs()
+    runner.slots[CRAWL_CREATOR] = 1
+    scheduler.claim.side_effect = claim
+    in_transit = asyncio.create_task(runner._fill())
+    try:
+        await asyncio.wait_for(claiming.wait(), 1)
+        wait_now.set()
+        await job
+        may_reply.set()
+        await asyncio.wait_for(in_transit, 1)
+        assert scheduler.claim.await_args_list == [
+            call({DOWNLOAD_VIDEO: 1}),
+            call({CRAWL_CREATOR: 1}),
+        ]
+    finally:
+        await cancel_jobs(runner, in_transit)
+
+
+async def test_claim_backs_off_when_the_last_idle_identity_is_lost_in_transit(claim_clock):
+    active = task()
+    available = 1
+
+    async def claim(_):
+        nonlocal available
+        available = 0
+        return [active]
+
+    scheduler, handler = server(), AsyncMock()
+    scheduler.claim.side_effect = claim
+    runner = run_with(scheduler, handler, slots={DOWNLOAD_VIDEO: 1}, available=lambda: available)
+    await runner._fill()
+    await asyncio.gather(*runner.jobs())
+    handler.assert_not_awaited()
+    scheduler.defer.assert_awaited_once_with(
+        active.attempt_id, 1, "本机身份或执行名额已变更", False, None
+    )
+
+    available = 1
+    await runner._fill()
+    scheduler.claim.assert_awaited_once()
+    claim_clock.return_value += 5
+    scheduler.claim.side_effect = None
+    scheduler.claim.return_value = []
+    await runner._fill()
+    assert scheduler.claim.await_count == 2
+
+
+async def test_claim_loop_backs_off_after_a_connection_failure(claim_clock):
+    polled = asyncio.Queue()
+    recovered = asyncio.Event()
+
+    def available():
+        polled.put_nowait(None)
+        return 1
+
+    async def claim(_):
+        if scheduler.claim.await_count == 1:
+            raise httpx.ConnectError("unavailable")
+        recovered.set()
+        return []
+
+    scheduler = server()
+    scheduler.claim.side_effect = claim
+    runner = run_with(scheduler, AsyncMock(), available=available)
+    loop = asyncio.create_task(runner.run())
+    try:
+        await asyncio.wait_for(polled.get(), 1)
+        runner.wake()
+        await asyncio.wait_for(polled.get(), 1)
+        scheduler.claim.assert_awaited_once()
+
+        claim_clock.return_value += 5
+        runner.wake()
+        await asyncio.wait_for(recovered.wait(), 1)
+    finally:
+        await cancel_jobs(runner, loop)
 
 
 async def test_a_deleted_video_ends_at_once():

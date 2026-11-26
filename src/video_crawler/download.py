@@ -323,13 +323,25 @@ class Downloader:
             async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
                 navigation = await page.goto(work["url"], wait_until="domcontentloaded")
                 if navigation is not None:
-                    _check_address_status(navigation.status, navigation.headers.get("retry-after"))
-                candidates = _page_media(
-                    await page_data(page), work["work_id"], self._max_video_height
-                )
+                    status = navigation.status
+                    _check_address_status(status, navigation.headers.get("retry-after"))
+                    if status == 403 or status >= 500:
+                        raise Stop(f"读作品页返回 HTTP {status}")
+                data = await page_data(page)
+                try:
+                    candidates = _page_media(data, work["work_id"], self._max_video_height)
+                except (ValueError, tiktok.NoPlaybackAddress) as error:
+                    if isinstance(error, tiktok.BlockedVideoPage):
+                        raise
+                    notice = ""
+                    with suppress(BrowserError):
+                        notice = await page.evaluate("document.body?.innerText ?? ''")
+                    if reason := tiktok.video_access_notice(notice):
+                        raise Gone(reason) from None
+                    raise
                 self._pool.refreshed(identity, await session_of(page))
                 return candidates
-        except LookupError as error:
+        except tiktok.VideoUnavailable as error:
             raise Gone(str(error)) from error
         except ValueError as error:
             raise Stop(str(error)) from error

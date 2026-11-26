@@ -126,6 +126,12 @@ def test_private_and_missing_accounts():
         tiktok.profile_of(scope_with_user(id="1", uniqueId="someone"), "alice")
 
 
+def test_profile_needs_login_only_for_a_viewing_gate():
+    assert tiktok.needs_login("This creator turned on\naudience controls")
+    assert tiktok.needs_login("Log in to view this creator’s posts")
+    assert not tiktok.needs_login("Log in to TikTok to like videos and follow creators")
+
+
 def video_scope(work_id="7", **video) -> dict:
     return {
         "webapp.video-detail": {
@@ -133,6 +139,22 @@ def video_scope(work_id="7", **video) -> dict:
             "itemInfo": {"itemStruct": {"id": work_id, "video": video}},
         }
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "item"),
+    [
+        (1, {"id": "7", "video": {}}),
+        (False, {"id": "7", "video": {}}),
+        (0, {"id": "7", "imagePost": {}}),
+        (0, {"id": "7", "video": []}),
+        (0, {"id": "7", "video": {"playAddr": "invalid"}}),
+        (0, {"id": "7", "video": {"bitrateInfo": [{"PlayAddr": "invalid"}]}}),
+    ],
+)
+def test_media_with_no_candidates_is_not_always_restricted(status, item):
+    data = {"webapp.video-detail": {"statusCode": status, "itemInfo": {"itemStruct": item}}}
+    assert tiktok.media_of(data, "7") == []
 
 
 def test_media_candidates_in_order_without_duplicates():

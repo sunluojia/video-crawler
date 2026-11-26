@@ -12,9 +12,9 @@ from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 
 from video_crawler import download, tiktok
 from video_crawler.browser import Session
-from video_crawler.errors import Retry, Wait
+from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
-from video_crawler.runner import DOWNLOAD_VIDEO
+from video_crawler.runner import DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease
 from video_crawler.settings import Settings
 
@@ -26,7 +26,12 @@ DIRECT = {"kind": "direct"}
 
 
 def page_data(video: dict) -> dict:
-    return {"webapp.video-detail": {"itemInfo": {"itemStruct": {"id": "7", "video": video}}}}
+    return {
+        "webapp.video-detail": {
+            "statusCode": 0,
+            "itemInfo": {"itemStruct": {"id": "7", "video": video}},
+        }
+    }
 
 
 def html(data: dict) -> str:
@@ -75,6 +80,9 @@ def attempt(tmp_path, monkeypatch):
         return 204
 
     scheduler = SimpleNamespace(
+        instance="crawler-1",
+        session_id="session-1",
+        defer=AsyncMock(),
         lease=AsyncMock(side_effect=grant),
         release=AsyncMock(side_effect=release),
         upload=AsyncMock(side_effect=upload),
@@ -100,7 +108,7 @@ def attempt(tmp_path, monkeypatch):
         async def __aexit__(self, *args):
             pass
 
-    page = SimpleNamespace(goto=AsyncMock(return_value=None))
+    page = SimpleNamespace(goto=AsyncMock(return_value=None), evaluate=AsyncMock(return_value=""))
 
     @asynccontextmanager
     async def open_browser(profile, route):
@@ -143,7 +151,26 @@ def attempt(tmp_path, monkeypatch):
         curl_response=curl_response,
         curl_get=curl_get,
         browser_data=browser_data,
+        page=page,
     )
+
+
+@pytest.fixture
+def run_attempt(attempt):
+    publish = AsyncMock()
+    runner = Runner(
+        attempt.scheduler,
+        {DOWNLOAD_VIDEO: attempt.run},
+        {DOWNLOAD_VIDEO: 1},
+        available_identities=lambda: 1,
+        publish=publish,
+    )
+
+    async def run():
+        await runner.attempt(attempt.task)
+        return [call.args[0] for call in publish.await_args_list]
+
+    return run
 
 
 async def test_download_does_not_request_a_line_without_an_identity(attempt):
@@ -206,10 +233,12 @@ async def test_us_page_lease_is_released_before_hk_media_is_requested(attempt):
 
 
 @pytest.mark.parametrize(
-    "curl_data", [None, {}, page_data({})], ids=["challenge", "no-work", "no-media"]
+    "curl_body",
+    ["", "challenge", html({}), html(page_data({"playAddr": "invalid"}))],
+    ids=["empty", "challenge", "no-work", "invalid-media"],
 )
-async def test_chrome_falls_back_with_the_same_identity_and_us_lease(attempt, curl_data):
-    attempt.curl_response.text = html(curl_data) if curl_data is not None else "challenge"
+async def test_chrome_falls_back_with_the_same_identity_and_us_lease(attempt, curl_body):
+    attempt.curl_response.text = curl_body
     await attempt.run(attempt.task)
     assert attempt.trace[:5] == [
         ("lease", "US"),
@@ -231,6 +260,125 @@ async def test_a_page_failure_does_not_request_or_penalize_the_download_line(att
     assert attempt.trace[-1] == ("release", "US", "suspect")
     assert [lease.line for lease in attempt.leases] == ["US"]
     attempt.pool.give_back.assert_called_once_with(attempt.identity, "neutral")
+    attempt.scheduler.upload.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("detail", "reason"),
+    [
+        ({"statusCode": 10204}, "视频已删除或不存在"),
+        ({"statusCode": 10216}, "视频需关注或为私密视频"),
+        ({"statusCode": 10222}, "视频需关注或为私密视频"),
+        ({"statusCode": 1, "statusMsg": "This post is private"}, "视频需关注或为私密视频"),
+        ({"statusCode": 1, "statusMsg": "login required"}, "视频需登录查看"),
+        ({"statusCode": 1, "statusMsg": "This content is age-restricted"}, "视频需登录查看"),
+        (
+            {"statusCode": 0, "itemInfo": {"itemStruct": {"id": "7", "privateItem": True}}},
+            "视频需关注或为私密视频",
+        ),
+        (
+            {"statusCode": 0, "itemInfo": {"itemStruct": {"id": "7", "anchors": [{}]}}},
+            "挂车/受限视频（服务端未返回播放地址）",
+        ),
+        (
+            {"statusCode": 0, "itemInfo": {"itemStruct": {"id": "7", "AnchorTypes": [1]}}},
+            "挂车/受限视频（服务端未返回播放地址）",
+        ),
+        (
+            page_data({"playAddr": "", "downloadAddr": "", "bitrateInfo": []})[
+                "webapp.video-detail"
+            ],
+            "受限视频（服务端未返回播放地址）",
+        ),
+    ],
+    ids=[
+        "deleted", "private-post", "private-account", "private-notice", "login", "age",
+        "private-flag", "anchors", "anchor-types", "no-address",
+    ],
+)
+async def test_curl_content_failure_is_terminal_without_chrome(
+    attempt, run_attempt, detail, reason
+):
+    attempt.curl_response.text = html({"webapp.video-detail": detail})
+
+    events = await run_attempt()
+
+    assert [event["type"] for event in events] == ["accepted", "download_failed"]
+    assert events[-1]["reason"] == reason
+    assert attempt.trace == [("lease", "US"), ("page", "curl"), ("release", "US", "normal")]
+    attempt.scheduler.defer.assert_not_awaited()
+    attempt.scheduler.upload.assert_not_awaited()
+    attempt.page.goto.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("data", "notice", "reason"),
+    [
+        (None, "Log in to watch this video", "视频需登录查看"),
+        (page_data({}), "This content is age-restricted.", "视频需登录查看"),
+        (None, "Follow this creator to watch this video", "视频需关注或为私密视频"),
+    ],
+)
+async def test_chrome_can_read_a_visible_video_gate(attempt, data, notice, reason):
+    attempt.curl_response.text = ""
+    attempt.browser_data.return_value = data
+    attempt.page.evaluate.return_value = notice
+
+    with pytest.raises(Gone) as failure:
+        await attempt.run(attempt.task)
+
+    assert str(failure.value) == reason
+    assert attempt.trace[-1] == ("release", "US", "normal")
+    attempt.scheduler.upload.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "problem", ["empty", "challenge", "parse", 403, 503, "proxy-down", "blocked-status"]
+)
+async def test_inconclusive_pages_and_network_failures_are_deferred(
+    attempt, run_attempt, monkeypatch, problem
+):
+    if problem == "proxy-down":
+        attempt.curl_get.side_effect = CurlConnectionError("connection closed")
+        monkeypatch.setattr(download, "proxy_reachable", AsyncMock(return_value=False))
+    elif problem == "blocked-status":
+        data = {
+            "webapp.video-detail": {
+                "statusCode": 10204,
+                "statusMsg": "Your IP address is blocked from accessing this post",
+            }
+        }
+        attempt.curl_response.text = html(data)
+        attempt.browser_data.return_value = data
+        attempt.page.evaluate.return_value = "Log in to watch this video"
+    elif isinstance(problem, int):
+        attempt.curl_response.status_code = problem
+        attempt.page.goto.return_value = SimpleNamespace(status=problem, headers={})
+        # 风控页或服务端错误的 HTTP 状态优先于正文里的内容提示。
+        attempt.browser_data.return_value = page_data({})
+        attempt.page.evaluate.return_value = "Log in to watch this video"
+    else:
+        attempt.curl_response.text = {
+            "empty": "",
+            "challenge": "Verify to continue",
+            "parse": f'<script id="{tiktok.DATA_ID}">{{invalid</script>',
+        }[problem]
+        attempt.browser_data.return_value = None
+        attempt.page.evaluate.return_value = (
+            "Verify to continue\nLog in to watch this video" if problem == "challenge" else ""
+        )
+
+    events = await run_attempt()
+
+    assert [event["type"] for event in events] == ["accepted"]
+    attempt.scheduler.defer.assert_awaited_once()
+    if problem == "proxy-down":
+        assert attempt.scheduler.defer.await_args.args[3:] == (False, None)
+        assert attempt.trace[-1] == ("release", "US", "proxy_down")
+    else:
+        assert attempt.scheduler.defer.await_args.args[3:] == (True, "US")
+        assert ("page", "chrome") in attempt.trace
+        assert attempt.trace[-1] == ("release", "US", "suspect")
     attempt.scheduler.upload.assert_not_awaited()
 
 

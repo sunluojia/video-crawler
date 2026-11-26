@@ -27,6 +27,23 @@ USER_GONE = 10221
 """账号不存在或已封禁（statusMsg 为 user banned）。"""
 ITEM_GONE = 10204
 """作品不存在（item doesn't exist）。"""
+ITEM_PRIVATE = (10216, 10222)
+"""私密作品、私密账号。"""
+VIDEO_LOGIN_REQUIRED = "视频需登录查看"
+VIDEO_PRIVATE = "视频需关注或为私密视频"
+
+
+class VideoUnavailable(LookupError):
+    """作品详情已经给出明确的不可用结论。"""
+
+
+class NoPlaybackAddress(VideoUnavailable):
+    """服务端返回了目标视频，但未提供播放地址。"""
+
+
+class BlockedVideoPage(ValueError):
+    """作品页有验证或访问封锁提示，可以换线路后再试。"""
+
 
 _DATA = re.compile(rf'<script id="{DATA_ID}"[^>]*>(.*?)</script>', re.S)
 _RESOLUTION_LABEL = re.compile(r"(?:^|[_-])([1-9][0-9]{2,3})p?(?=$|[_-])", re.IGNORECASE)
@@ -50,8 +67,45 @@ AUDIENCE_CONTROLS = "this creator turned on audience controls"
 """达人开启受众控制时主页上的提示，取自旧系统实际遇到的页面；这类达人要登录才能看作品。"""
 
 
+_PROFILE_LOGIN_PROMPT = re.compile(
+    r"\b(?:log ?in|sign ?in) to (?:watch|view|see) this creator's (?:videos|posts)\b"
+)
+_VIDEO_LOGIN_PROMPT = re.compile(
+    r"\b(?:log ?in|sign ?in) to (?:watch|view|see) this (?:video|post|content)\b"
+    r"|\bthis (?:video|post|content) is age[- ]restricted\b"
+)
+_VIDEO_PRIVATE_PROMPT = re.compile(
+    r"\bthis (?:account|video|post) is private\b"
+    r"|\bfollow this (?:creator|account) to (?:watch|view|see) "
+    r"(?:this (?:video|post)|their (?:videos|posts|contents))\b"
+)
+_VIDEO_PAGE_BLOCKED = re.compile(
+    r"\bcaptcha\b|\bverify (?:to continue|you(?: are|'re) human)\b"
+    r"|\b(?:ip address|access) (?:is|has been) blocked\b"
+)
+
+
+def _notice_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.casefold().replace("’", "'").split())
+
+
 def needs_login(page_text: str) -> bool:
-    return AUDIENCE_CONTROLS in " ".join(page_text.casefold().split())
+    notice = _notice_text(page_text)
+    return AUDIENCE_CONTROLS in notice or bool(_PROFILE_LOGIN_PROMPT.search(notice))
+
+
+def video_access_notice(page_text: str) -> str | None:
+    """识别要求登录观看或关注的提示。导航栏的登录按钮本身不足以判断。"""
+    notice = _notice_text(page_text)
+    if _VIDEO_PAGE_BLOCKED.search(notice):
+        raise BlockedVideoPage("作品页出现验证或访问封锁提示")
+    if _VIDEO_PRIVATE_PROMPT.search(notice):
+        return VIDEO_PRIVATE
+    if AUDIENCE_CONTROLS in notice or _VIDEO_LOGIN_PROMPT.search(notice):
+        return VIDEO_LOGIN_REQUIRED
+    return None
 
 
 def profile_of(data: dict, handle: str) -> tuple[str | None, dict | None]:
@@ -77,19 +131,55 @@ def profile_of(data: dict, handle: str) -> tuple[str | None, dict | None]:
 
 
 def media_of(data: dict, work_id: str, max_video_height: int = MAX_VIDEO_HEIGHT) -> list[str]:
-    """读取作品页的媒体候选，按短边限制选流。作品不存在或页面无效时抛出异常。"""
+    """读取作品页的媒体候选，按短边限制选流。明确受限与无效页面分开处理。"""
     detail = data.get("webapp.video-detail") or {}
     if not isinstance(detail, dict):
         raise ValueError("作品页的详情格式无效")
-    if detail.get("statusCode") == ITEM_GONE:
-        raise LookupError("视频已删除或不存在")
+    status = detail.get("statusCode")
     info = detail.get("itemInfo")
     item = info.get("itemStruct") if isinstance(info, dict) else None
-    if not isinstance(item, dict) or str(item.get("id")) != work_id:
-        raise ValueError(
-            f"作品页没有这条视频（{detail.get('statusCode')} {detail.get('statusMsg')}）"
-        )
-    return media_candidates(item, max_video_height)
+    matches = isinstance(item, dict) and str(item.get("id")) == work_id
+    if matches or item is None or item == {}:
+        _check_video_access(status, detail.get("statusMsg"), item if matches else {})
+    if not matches:
+        raise ValueError(f"作品页没有这条视频（{status} {detail.get('statusMsg')}）")
+
+    candidates = media_candidates(item, max_video_height)
+    if not candidates and status == 0 and status is not False and _playback_withheld(item):
+        kind = "挂车/受限视频" if item.get("anchors") or item.get("AnchorTypes") else "受限视频"
+        raise NoPlaybackAddress(f"{kind}（服务端未返回播放地址）")
+    return candidates
+
+
+def _check_video_access(status: object, message: object, item: dict) -> None:
+    notice = _notice_text(message).rstrip(".!。！")
+    reason = video_access_notice(notice)
+    if status == ITEM_GONE:
+        raise VideoUnavailable("视频已删除或不存在")
+    if (
+        status in ITEM_PRIVATE
+        or item.get("privateItem") is True
+        or notice in {"private item", "item is private", "user is private", "private account"}
+    ):
+        raise VideoUnavailable(VIDEO_PRIVATE)
+    if notice in {"login required", "login_required", "not logged in", "age restricted"}:
+        raise VideoUnavailable(VIDEO_LOGIN_REQUIRED)
+    if reason:
+        raise VideoUnavailable(reason)
+
+
+def _playback_withheld(item: dict) -> bool:
+    if item.get("imagePost") is not None:
+        return False
+    video = item.get("video")
+    if video is None:
+        return True
+    return (
+        isinstance(video, dict)
+        and video.get("playAddr") in (None, "")
+        and video.get("downloadAddr") in (None, "")
+        and video.get("bitrateInfo") in (None, [])
+    )
 
 
 def _positive_int(value: object) -> int | None:

@@ -1,10 +1,11 @@
 import hashlib
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import httpx
 
+from video_crawler.errors import Wait
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Scheduler
 from video_crawler.settings import Settings
 from video_crawler.store import IdentityStore
@@ -141,3 +142,65 @@ def test_identity_redis_keys_are_per_device_and_retirement_removes_active_record
     pipe.zadd.assert_called_once_with(f"{key}:retired", {json.dumps(retired): 900})
     pipe.hvals.assert_called_once_with(key)
     pipe.zrange.assert_called_once_with(f"{key}:retired", 0, -1)
+
+
+async def test_claim_with_wait_reads_optional_crawl_wait_hint():
+    settings = Settings(service_token="t" * 16)
+    scheduler = Scheduler(settings)
+    response = MagicMock()
+    response.raise_for_status.return_value = response
+    response.json.return_value = {
+        "tasks": [],
+        "crawl_wait": {
+            "retry_after": 181,
+            "reason": "采集线路正在冷却",
+            "reason_code": "crawl_empty_cooldown",
+        },
+    }
+    scheduler._http.post = AsyncMock(return_value=response)
+
+    tasks, wait = await scheduler.claim_with_wait({"crawl_creator": 2, "download_video": 4})
+    assert tasks == []
+    assert isinstance(wait, Wait)
+    assert (wait.seconds, wait.use, wait.code) == (
+        181,
+        "crawler.crawl_creator",
+        "crawl_empty_cooldown",
+    )
+
+
+async def test_claim_with_wait_accepts_old_reply_without_hint():
+    settings = Settings(service_token="t" * 16)
+    scheduler = Scheduler(settings)
+    response = MagicMock()
+    response.raise_for_status.return_value = response
+    response.json.return_value = {"tasks": []}
+    scheduler._http.post = AsyncMock(return_value=response)
+
+    tasks, wait = await scheduler.claim_with_wait({"crawl_creator": 1})
+    assert tasks == [] and wait is None
+
+
+def test_protected_retirement_keeps_a_device_archive_outside_the_recent_window():
+    client = MagicMock()
+    pipe = client.pipeline.return_value.__enter__.return_value
+    pipe.hvals.return_value = pipe.zrange.return_value = pipe
+    key = "video-crawler:{crawler-1}:identities"
+    archived = {"id": "archived", "retired_at": 900}
+    recent = {"id": "recent", "retired_at": 960}
+    store = IdentityStore(client, "crawler-1", keep_profile_dirs=True)
+    store.save([archived])
+    pipe.hset.assert_called_once_with(
+        f"{key}:kept-retired",
+        mapping={
+            "archived": json.dumps(archived),
+        },
+    )
+    pipe.execute.return_value = [[], [json.dumps(recent)], [json.dumps(archived)]]
+    assert store.records() == [archived, recent]
+    client.hset.assert_called_once_with(
+        f"{key}:kept-retired",
+        mapping={
+            "recent": json.dumps(recent),
+        },
+    )

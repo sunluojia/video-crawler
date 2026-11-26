@@ -63,9 +63,21 @@ class Scheduler:
         """正在用的线路，随心跳续期。"""
 
     async def claim(self, kinds: dict[str, int]) -> list[ClaimedTask]:
+        reply = await self._claim_reply(kinds)
+        return [ClaimedTask(**task) for task in reply["tasks"]]
+
+    async def claim_with_wait(self, kinds: dict[str, int]) -> tuple[list[ClaimedTask], Wait | None]:
+        reply = await self._claim_reply(kinds)
+        hint = reply.get("crawl_wait")
+        wait = None
+        if hint:
+            wait = Wait(hint["retry_after"], hint["reason"], CRAWL, code=hint.get("reason_code"))
+        return [ClaimedTask(**task) for task in reply["tasks"]], wait
+
+    async def _claim_reply(self, kinds: dict[str, int]) -> dict:
         body = {"executor_id": self.instance, "executor_session_id": str(self.session_id)}
         response = await self._http.post("/api/crawler-tasks/claim", json={**body, "kinds": kinds})
-        return [ClaimedTask(**task) for task in response.raise_for_status().json()["tasks"]]
+        return response.raise_for_status().json()
 
     async def defer(
         self,
@@ -95,11 +107,14 @@ class Scheduler:
         avoid: Sequence[str] = (),
         *,
         attempt_id: str | None = None,
+        warm_bootstrap: bool = False,
     ) -> Lease:
         """申请一条线路；分不到时抛 Wait，按调度中心给的时间再来。"""
         body = {"device": self.instance, "use": use, "task_id": task_id, "avoid": list(avoid)}
         if attempt_id is not None:
             body["attempt_id"] = attempt_id
+        if warm_bootstrap:
+            body["warm_bootstrap"] = True
         try:
             response = await self._http.post("/api/proxy-leases", json=body)
             reply = response.raise_for_status().json()
@@ -107,7 +122,10 @@ class Scheduler:
             raise Wait(30, f"调度中心连不上：{error}") from error
         if not (grant := reply["lease"]):
             raise Wait(
-                reply["retry_after"] or 30, f"没有{USE_NAMES[use]}线路：{reply['reason']}", use
+                reply["retry_after"] or 30,
+                f"没有{USE_NAMES[use]}线路：{reply['reason']}",
+                use,
+                code=reply.get("reason_code"),
             )
         self.leases.add(grant["lease_id"])
         return Lease(grant["lease_id"], grant["line"], grant["route"])

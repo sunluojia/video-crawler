@@ -69,7 +69,7 @@ async def publish_event(broker: RedisBroker, item: dict) -> None:
 
 
 async def _serve(settings: Settings, redis: Redis) -> None:
-    store = IdentityStore(redis, settings.instance_id)
+    store = IdentityStore(redis, settings.instance_id, keep_profile_dirs=settings.preserve_profiles)
     scheduler = Scheduler(settings)
     browsers = Browsers(settings.chrome_channel, warm_headless=settings.warm_headless)
     pool = IdentityPool(settings, store, scheduler, browsers)
@@ -104,6 +104,8 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         },
         {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0},  # 第一次心跳拿到并发数之前不开始
         available_identities=lambda: len(pool.available()),
+        available_crawl_identities=lambda: len(pool.available_for_crawl()),
+        settings=settings,
         cached_download=downloader.has_cached_media,
         publish=partial(publish_event, broker),
     )

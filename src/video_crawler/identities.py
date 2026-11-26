@@ -22,7 +22,7 @@ from redis.exceptions import RedisError
 
 from video_crawler import tiktok
 from video_crawler.browser import Browsers, Session, session_of
-from video_crawler.errors import Retry, Wait
+from video_crawler.errors import WARM_EMPTY_WAIT, Retry, Wait, crawl_identity_hold
 from video_crawler.scheduler import CRAWL, Scheduler
 from video_crawler.settings import Settings
 from video_crawler.store import RETIRED_SHOWN, RETIRED_SINCE, IdentityStore
@@ -35,6 +35,7 @@ REFRESH_AFTER = 25 * 60
 CHECK_EVERY = 12
 WARM_TIMEOUT = 45_000
 WARM_RETRY_AFTER = 60
+WARM_LOCAL_WAIT = "warm_local_wait"
 """同一资料预热失败后稍后再试，让其他资料先用预热名额。"""
 DOWNLOAD_IDENTITY_WAIT = 60
 """待取链的下载等身份的上限，超时退回时不扣尝试。"""
@@ -66,6 +67,8 @@ class Identity:
     warm_retry_at: float = 0
     listing_fails: int = 0
     """当前浏览器会话中以空正文结束的采集次数。重启后会重新预热，所以只记在内存。"""
+    listing_refresh_at: float | None = None
+    """需要刷新列表会话时的单调时钟截止。有效下载凭据仍可使用。"""
 
     @property
     def consecutive_failures(self) -> int:
@@ -93,6 +96,13 @@ class IdentityPool:
     ) -> None:
         self._root = settings.profile_root
         self._store, self._scheduler, self._browsers = store, scheduler, browsers
+        self._keep_profile_dirs = settings.preserve_profiles
+        self._crawl_policy = settings.crawl_policy_enabled
+        self._listing_hold = settings.crawl_empty_session_hold_seconds if self._crawl_policy else 0
+        self._warm_recovery = settings.crawl_warm_recovery_min_seconds if self._crawl_policy else 0
+        self._last_warm_started: float | None = None
+        self._warm_wait_until = self._warm_pressure_until = 0.0
+        self._active_warms = 0
         self.target = 0
         """要保持的可用身份数，账号池页面设置，调度中心随心跳按设备分摊下发；拿到之前不新建。"""
         self.warm_slots = 0
@@ -120,6 +130,7 @@ class IdentityPool:
             identity = Identity(**record)
             known.add(identity.id)
             if identity.retired_at is not None:
+                self.identities.pop(identity.id, None)
                 self._retired.append(identity)
                 continue
             self.identities[identity.id] = identity
@@ -242,11 +253,18 @@ class IdentityPool:
             if not identity.busy and self._usable_session(identity, now)
         ]
 
-    def take(self, *, preferred_id: str | None = None) -> Identity:
+    def available_for_crawl(self) -> list[Identity]:
+        return [identity for identity in self.available() if identity.listing_refresh_at is None]
+
+    def take(self, *, preferred_id: str | None = None, for_listing: bool = False) -> Identity:
         """优先用指定的空闲身份，其次按连续失败次数和上次使用时间排序。"""
         ready = self.available()
         if not ready:
             raise Wait(10, "没有可用身份")
+        if for_listing:
+            ready = [identity for identity in ready if identity.listing_refresh_at is None]
+            if not ready:
+                raise crawl_identity_hold()
         identity = min(
             ready,
             key=lambda item: (
@@ -299,11 +317,16 @@ class IdentityPool:
                 identity.fails = 0
                 if result == "listing_ok":
                     identity.listing_fails = 0
+                    identity.listing_refresh_at = None
             elif result == "empty_response":
                 identity.listing_fails += 1
                 if identity.listing_fails >= COUNTED_FAILS:
-                    identity.cooldown_until = now + COOLDOWN
-                    identity.session = None
+                    if self._listing_hold:
+                        identity.listing_refresh_at = time.monotonic() + self._listing_hold
+                        self._wake.set()
+                    else:
+                        identity.cooldown_until = now + COOLDOWN
+                        identity.session = None
         self._save_use(identity, now)
 
     def record_download(
@@ -353,7 +376,9 @@ class IdentityPool:
 
     def refresh(self, identity: Identity) -> None:
         """账号池页面要求立即刷新：当作过期，后台循环下一个就预热它。"""
-        identity.warmed_at = identity.warm_retry_at = 0
+        if identity.listing_refresh_at is None:
+            identity.warmed_at = 0
+        identity.warm_retry_at = 0
         self._wake.set()
         self._available_changed.set()
 
@@ -363,6 +388,22 @@ class IdentityPool:
         if (target, warm_slots) != (self.target, self.warm_slots):
             self.target, self.warm_slots = target, warm_slots
             self._wake.set()
+
+    def _under_pressure(self, now: float) -> bool:
+        return self._crawl_policy and (
+            now < self._warm_pressure_until
+            or any(identity.listing_fails >= COUNTED_FAILS for identity in self.identities.values())
+        )
+
+    def _warm_delay(self, now: float) -> float:
+        until = self._warm_wait_until
+        if (
+            self._warm_recovery
+            and self._last_warm_started is not None
+            and self._under_pressure(now)
+        ):
+            until = max(until, self._last_warm_started + self._warm_recovery)
+        return max(0, until - now)
 
     async def run(self) -> None:
         jobs: set[asyncio.Task[None]] = set()
@@ -375,7 +416,12 @@ class IdentityPool:
             async with asyncio.TaskGroup() as group:
                 while True:
                     self._wake.clear()
-                    for _ in range(self.warm_slots - len(jobs)):
+                    now = time.monotonic()
+                    delay = self._warm_delay(now)
+                    slots = self.warm_slots - len(jobs)
+                    if self._warm_recovery and self._under_pressure(now):
+                        slots = min(slots, 1 - len(jobs))
+                    for _ in range(0 if delay else slots):
                         identity = self._next()
                         if identity is None:
                             break
@@ -385,7 +431,7 @@ class IdentityPool:
                         jobs.add(job)
                         job.add_done_callback(finished)
                     with suppress(TimeoutError):
-                        await asyncio.wait_for(self._wake.wait(), CHECK_EVERY)
+                        await asyncio.wait_for(self._wake.wait(), delay or CHECK_EVERY)
         finally:
             # 关闭时也释放已预留但还未来得及启动的身份。
             for identity in self._warming.values():
@@ -395,11 +441,27 @@ class IdentityPool:
     async def _attempt(self, identity: Identity) -> None:
         retry_delay = CHECK_EVERY
         retry_profile = True
+        profile = self.profile(identity)
+        created_here = False
         try:
+            if self._keep_profile_dirs and identity.id not in self.identities:
+                with suppress(FileExistsError):
+                    profile.mkdir(parents=True)
+                    created_here = True
             if await self._warm(identity):
                 return
         except Wait as wait:
+            if wait.code == WARM_LOCAL_WAIT:
+                return
             log.info("预热等线路：%s", wait.reason)
+            if self._crawl_policy and wait.code == WARM_EMPTY_WAIT:
+                until = time.monotonic() + max(1, wait.seconds)
+                self._warm_wait_until = max(self._warm_wait_until, until)
+                self._warm_pressure_until = max(
+                    self._warm_pressure_until, until + self._warm_recovery
+                )
+                self._wake.set()
+                return
             retry_delay = max(retry_delay, wait.seconds)
             retry_profile = False
         except Exception:
@@ -410,8 +472,10 @@ class IdentityPool:
             self._available_changed.set()
             if identity.id in self.identities and identity.fails >= RETIRE_FAILS:
                 self._save_use(identity, time.time())
-            elif identity.id not in self.identities:
-                shutil.rmtree(self.profile(identity), ignore_errors=True)
+            elif identity.id not in self.identities and (
+                not self._keep_profile_dirs or (created_here and identity.retired_at is None)
+            ):
+                shutil.rmtree(profile, ignore_errors=True)
         if retry_profile:
             identity.warm_retry_at = time.time() + WARM_RETRY_AFTER
         await asyncio.sleep(retry_delay)
@@ -420,9 +484,13 @@ class IdentityPool:
         """先恢复缺少的可用身份，再提前刷新还有效的会话。"""
         if not self.target:
             return None
-        now = time.time()
+        now, monotonic_now = time.time(), time.monotonic()
+
+        def ready(identity: Identity) -> bool:
+            return identity.listing_refresh_at is None and self._usable_session(identity, now)
+
         available = sum(
-            identity.fails < COUNTED_FAILS and self._usable_session(identity, now)
+            identity.fails < COUNTED_FAILS and ready(identity)
             for identity in self.identities.values()
         )
         candidates = [
@@ -431,27 +499,45 @@ class IdentityPool:
             if not identity.busy
             and identity.cooldown_until <= now
             and identity.warm_retry_at <= now
+            and (
+                identity.listing_refresh_at is None or identity.listing_refresh_at <= monotonic_now
+            )
         ]
         if available >= self.target:
             return min(
-                (identity for identity in candidates if not identity.fresh(now, REFRESH_AFTER)),
-                key=lambda identity: identity.warmed_at,
+                (
+                    identity
+                    for identity in candidates
+                    if identity.listing_refresh_at is not None
+                    or not identity.fresh(now, REFRESH_AFTER)
+                ),
+                key=lambda identity: (identity.listing_refresh_at is None, identity.warmed_at),
                 default=None,
             )
         # 正在刷新但仍有有效会话的身份已计在 available 里。
         pending = sum(
-            identity.fails < COUNTED_FAILS and not self._usable_session(identity, now)
+            identity.fails < COUNTED_FAILS and not ready(identity)
             for identity in self._warming.values()
         )
         if available + pending >= self.target:
             return None
         stale = min(
-            (identity for identity in candidates if not self._usable_session(identity, now)),
-            key=lambda identity: (identity.fails, identity.warmed_at),
+            (identity for identity in candidates if not ready(identity)),
+            key=lambda identity: (
+                identity.listing_refresh_at is None,
+                identity.fails,
+                identity.warmed_at,
+            ),
             default=None,
         )
         if stale is not None and stale.fails < COUNTED_FAILS:
             return stale
+        if self.identities and self._under_pressure(monotonic_now):
+            return stale or min(
+                (identity for identity in candidates if not identity.fresh(now, REFRESH_AFTER)),
+                key=lambda identity: identity.warmed_at,
+                default=None,
+            )
         pending_new = sum(key not in self.identities for key in self._warming)
         if len(self.identities) + pending_new < self.target * MAX_FACTOR:
             return Identity(uuid4().hex[:12])
@@ -459,24 +545,45 @@ class IdentityPool:
 
     async def _warm(self, identity: Identity) -> bool:
         """预热：打开首页等页面数据出现，拿到 tt_chain_token 才算成功。新建的成功后才加入身份池。"""
-        lease = await self._scheduler.lease(CRAWL, avoid=self._avoid)
+        options = {}
+        session_now = time.time()
+        if self._crawl_policy and not any(
+            item.listing_refresh_at is None and self._usable_session(item, session_now)
+            for item in self.identities.values()
+        ):
+            options["warm_bootstrap"] = True
+        lease = await self._scheduler.lease(CRAWL, avoid=self._avoid, **options)
         session, detail = None, "预热没拿到 tt_chain_token"
+        started = skipped = False
         try:
+            self._check_warm_start()
             async with self._browsers.open(
                 self.profile(identity), lease.route, warming=True
             ) as page:
+                # 等 Chrome 槽位期间可能进入压力期。首页发出前再次确认，按实际发出计时。
+                now = self._check_warm_start()
+                if self._crawl_policy:
+                    self._record_warm_start(now)
+                self._active_warms += 1
+                started = True
                 await page.goto(tiktok.HOME, wait_until="domcontentloaded", timeout=WARM_TIMEOUT)
                 await page.wait_for_selector(
                     f"#{tiktok.DATA_ID}", state="attached", timeout=WARM_TIMEOUT
                 )
                 session = await session_of(page)
+        except Wait as wait:
+            skipped = wait.code == WARM_LOCAL_WAIT
+            raise
         except (BrowserError, Retry) as error:
             detail = f"预热失败：{error}"
         finally:
+            if started:
+                self._active_warms -= 1
             ok = bool(session and session.token)
-            self.note("warm", ok)
+            if not skipped:
+                self.note("warm", ok)
             await self._scheduler.release(
-                lease, "normal" if ok else "suspect", None if ok else detail
+                lease, "normal" if ok or skipped else "suspect", None if ok or skipped else detail
             )
         if not ok:
             self._avoid = [lease.line]
@@ -486,7 +593,9 @@ class IdentityPool:
         log.info("身份 %s 预热好了", identity.id)
         self.browser = identity.browser = session.browser
         self.refreshed(identity, session)
-        identity.listing_fails = 0
+        if not self._crawl_policy or identity.session is session:
+            identity.listing_fails = 0
+            identity.listing_refresh_at = None
         self._dirty[identity.id] = identity.record()
         self.identities[identity.id] = identity
         for other in list(self.identities.values()):
@@ -494,11 +603,25 @@ class IdentityPool:
                 self.retire(other, f"Chrome 从 {other.browser} 换成了 {self.browser}")
         return True
 
+    def _check_warm_start(self) -> float:
+        now = time.monotonic()
+        if self._warm_delay(now) or (
+            self._warm_recovery and self._active_warms and self._under_pressure(now)
+        ):
+            raise Wait(1, "本机预热等待，首页请求尚未发出", code=WARM_LOCAL_WAIT)
+        return now
+
+    def _record_warm_start(self, now: float) -> None:
+        self._last_warm_started = now
+        if self._under_pressure(now):
+            self._warm_pressure_until = max(self._warm_pressure_until, now + self._warm_recovery)
+
     def retire(self, identity: Identity, reason: str) -> None:
-        """删掉资料目录，后台会补一个新的。"""
+        """退休身份，后台会补一个新的。"""
         identity.retired_at, identity.retire_reason = time.time(), reason
         self.identities.pop(identity.id, None)
-        shutil.rmtree(self.profile(identity), ignore_errors=True)
+        if not self._keep_profile_dirs:
+            shutil.rmtree(self.profile(identity), ignore_errors=True)
         self._dirty[identity.id] = identity.record()
         self._retired.append(identity)
         log.info("身份 %s 退休：%s", identity.id, reason)

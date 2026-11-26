@@ -83,6 +83,120 @@ async def cancel_jobs(runner, *others):
     await asyncio.gather(*jobs, return_exceptions=True)
 
 
+async def test_crawl_policy_claim_wait_does_not_block_download_claims(claim_clock):
+    download = task(DOWNLOAD_VIDEO, task_id="download-1")
+    wait = Wait(180, "采集线路正在冷却", CRAWL, code="crawl_empty_cooldown")
+    scheduler = server(download)
+    scheduler.claim_with_wait = AsyncMock(side_effect=[([], wait), ([], None)])
+    handler = AsyncMock(return_value=None)
+    runner = Runner(
+        scheduler,
+        {CRAWL_CREATOR: handler, DOWNLOAD_VIDEO: handler},
+        SLOTS,
+        available_identities=lambda: 1,
+        publish=AsyncMock(),
+        settings=Settings(service_token=TOKEN, crawl_policy_enabled=True),
+    )
+
+    await runner._fill()  # 采集预判等待，同一轮继续下载。
+    scheduler.claim_with_wait.assert_awaited_once_with({CRAWL_CREATOR: 1})
+    scheduler.claim.assert_awaited_once_with({DOWNLOAD_VIDEO: 4})
+    assert list(runner.running) == [download.attempt_id]
+    await asyncio.gather(*runner.jobs())
+    handler.assert_awaited_once_with(download)
+    scheduler.defer.assert_not_awaited()
+
+    claim_clock.return_value = 279.99
+    await runner._fill()
+    scheduler.claim_with_wait.assert_awaited_once()
+    scheduler.claim.assert_awaited_with({DOWNLOAD_VIDEO: 4})
+    claim_clock.return_value = 280
+    await runner._fill()
+    assert scheduler.claim_with_wait.await_count == 2
+    scheduler.defer.assert_not_awaited()
+
+
+async def test_crawl_policy_backoff_during_claim_returns_late_crawl_and_starts_download(
+    claim_clock,
+):
+    crawl = task(CRAWL_CREATOR, task_id="crawl-1")
+    download = task(DOWNLOAD_VIDEO, task_id="download-1")
+    scheduler = server()
+    entered, finish_claim = asyncio.Event(), asyncio.Event()
+
+    async def claim(_):
+        entered.set()
+        await finish_claim.wait()
+        return [crawl, download], None
+
+    scheduler.claim_with_wait = AsyncMock(side_effect=claim)
+    handler = AsyncMock(return_value=None)
+    runner = Runner(
+        scheduler,
+        {CRAWL_CREATOR: handler, DOWNLOAD_VIDEO: handler},
+        SLOTS,
+        available_identities=lambda: 2,
+        publish=AsyncMock(),
+        settings=Settings(service_token=TOKEN, crawl_policy_enabled=True),
+    )
+
+    filling = asyncio.create_task(runner._fill())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        wait = Wait(360, "采集线路正在冷却", CRAWL, code="crawl_empty_cooldown")
+        runner._pause_crawl(wait)
+    finally:
+        finish_claim.set()
+        await filling
+    await asyncio.gather(*runner.jobs())
+    handler.assert_awaited_once_with(download)
+    scheduler.defer.assert_awaited_once_with(
+        crawl.attempt_id,
+        30,
+        wait.reason,
+        False,
+        None,
+    )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_crawl_claim_race_uses_configured_policy_or_legacy_wait(claim_clock, enabled):
+    crawl = task(CRAWL_CREATOR, task_id="crawl-1")
+    wait = Wait(181, "采集线路正在冷却", CRAWL, code="crawl_empty_cooldown")
+    scheduler = server()
+    scheduler.claim_with_wait = AsyncMock(return_value=([crawl], None))
+    scheduler.claim = AsyncMock(return_value=[crawl])
+    handler = AsyncMock(side_effect=wait)
+    runner = Runner(
+        scheduler,
+        {CRAWL_CREATOR: handler},
+        SLOTS,
+        available_identities=lambda: 2,
+        publish=AsyncMock(),
+        settings=Settings(service_token=TOKEN, crawl_policy_enabled=enabled),
+    )
+
+    await runner._claim({CRAWL_CREATOR: 1})
+    await asyncio.gather(*runner.jobs())
+    if enabled:
+        scheduler.claim_with_wait.assert_awaited_once()
+        scheduler.claim.assert_not_awaited()
+        assert runner._claim_capacity() == {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 4}
+        delay = 30
+    else:
+        scheduler.claim.assert_awaited_once()
+        scheduler.claim_with_wait.assert_not_awaited()
+        assert runner._claim_capacity() == {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: 0}
+        delay = 181
+    scheduler.defer.assert_awaited_once_with(
+        crawl.attempt_id,
+        delay,
+        wait.reason,
+        False,
+        None,
+    )
+
+
 def events(publish):
     return [entry.args[0] for entry in publish.await_args_list]
 

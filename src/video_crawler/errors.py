@@ -1,14 +1,32 @@
 """一次尝试没做成时怎么办，对应爬取方案第 7 节和单视频下载方案第 3 节的三类失败。"""
 
+CRAWL_WAIT_CODES = frozenset(
+    {
+        "crawl_paced",
+        "crawl_empty_cooldown",
+        "crawl_probe_busy",
+        "crawl_line_busy",
+        "crawl_identity_hold",
+    }
+)
+WARM_EMPTY_WAIT = "warm_empty_wait"
+
 
 class Wait(Exception):
     """环境问题：申请不到线路、没有可用身份、磁盘满……过一会儿再试，不算尝试次数。"""
 
-    def __init__(self, seconds: float, reason: str, use: str | None = None) -> None:
+    def __init__(
+        self, seconds: float, reason: str, use: str | None = None, *, code: str | None = None
+    ) -> None:
         super().__init__(reason)
         self.seconds, self.reason = seconds, reason
         self.use = use
         """受等待影响的用途。未指定时表示两类任务共用的环境。"""
+        self.code = code
+
+
+def crawl_identity_hold() -> Wait:
+    return Wait(10, "身份的作品列表会话待恢复", code="crawl_identity_hold")
 
 
 class Retry(Exception):

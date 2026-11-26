@@ -94,7 +94,7 @@ class Crawler:
             self._active.pop(task.attempt_id, None)
 
     async def _collect(self, task: ClaimedTask, progress: CrawlProgress) -> dict:
-        identity = self._pool.take()
+        identity = self._pool.take(for_listing=True)
         try:
             lease = await self._scheduler.lease(
                 CRAWL, task.task_id, task.avoid, attempt_id=task.attempt_id

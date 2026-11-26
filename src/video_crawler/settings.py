@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     """下载中的本地文件。"""
     profile_root: Path = Path("profiles")
     """身份的浏览器资料目录。里面有 Cookie，按密码对待，不进仓库。"""
+    crawl_policy_enabled: bool = False
+    crawl_defer_max_seconds: int = Field(default=30, ge=1, le=30)
+    crawl_empty_session_hold_seconds: int = Field(default=180, ge=0)
+    crawl_warm_recovery_min_seconds: int = Field(default=90, ge=0)
+    keep_profile_dirs: bool = False
     download_slow_bytes: int = Field(default=SLOW_BYTES, gt=0)
     """下载断开阈值，单位是字节每秒。"""
     download_slow_window: float = Field(default=SLOW_WINDOW, gt=0, allow_inf_nan=False)
@@ -47,6 +52,10 @@ class Settings(BaseSettings):
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到
     tt_chain_token，用无头预热出来的资料目录之后用有头采集完全正常（32 条，与有头预热一致）。
     采集作品必须保留有界面——同一资料目录、同一条线路，无头拿作品接口返回 403。"""
+
+    @property
+    def preserve_profiles(self) -> bool:
+        return self.crawl_policy_enabled or self.keep_profile_dirs
 
     @property
     def url(self) -> str:

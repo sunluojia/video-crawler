@@ -373,7 +373,7 @@ async def test_stopping_parallel_warmers_returns_leases_and_removes_unfinished_p
 
     @asynccontextmanager
     async def open_profile(profile, route, *, warming):
-        profile.mkdir()
+        profile.mkdir(exist_ok=True)
 
         async def goto(*args, **kwargs):
             opened.put_nowait(profile)
@@ -410,3 +410,128 @@ def test_refresh_and_retire_from_the_page(pool):
     assert client.post("/api/identities/ready/retire").status_code == 204
     assert "ready" not in pool.identities and not pool.profile(ready).exists()
     assert busy.id in pool.identities
+
+
+@pytest.fixture
+def pressure_pool(tmp_path, monkeypatch):
+    settings = Settings(service_token=TOKEN, profile_root=tmp_path, crawl_policy_enabled=True)
+    pool = IdentityPool(settings, Mock(spec=IdentityStore), Scheduler(settings), Browsers("chrome"))
+    pool.target, pool.browser = 3, "146"
+    now = [100.0]
+    monkeypatch.setattr(
+        identities, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time)
+    )
+    return pool, now
+
+
+async def test_empty_list_session_hold_keeps_download_and_respects_manual_refresh(pressure_pool):
+    pool, now = pressure_pool
+    identity = add(pool, "shared")
+    for _ in range(identities.COUNTED_FAILS):
+        pool.give_back(identity, "empty_response")
+    assert identity.listing_refresh_at == 280
+    assert identity.session is not None and identity in pool.available()
+    assert pool.available_for_crawl() == []
+    with pytest.raises(Wait) as blocked:
+        pool.take(for_listing=True)
+    assert blocked.value.code == "crawl_identity_hold"
+    assert await pool.take_for_download() is identity
+    pool.give_back(identity, "ok")
+    assert pool.download_credentials(identity.id) == ("ua", "TOKEN-VALUE")
+    pool.refresh(identity)
+    assert pool.download_credentials(identity.id) == ("ua", "TOKEN-VALUE")
+    assert pool._next() is None
+    now[0] = 280
+    assert pool._next() is identity and pool.available_for_crawl() == []
+
+
+async def test_pressure_warm_starts_remain_ninety_seconds_apart_despite_wakes(
+    pressure_pool,
+    monkeypatch,
+):
+    pool, now = pressure_pool
+    stale = [add(pool, name, warmed=False) for name in ("first", "second", "third")]
+    for identity in stale:
+        identity.listing_fails = identities.COUNTED_FAILS
+        identity.listing_refresh_at = now[0]
+    grants = AsyncMock(return_value=Lease("warm-lease", "203.0.113.1", {"kind": "direct"}))
+    release = AsyncMock()
+    monkeypatch.setattr(pool._scheduler, "lease", grants)
+    monkeypatch.setattr(pool._scheduler, "release", release)
+    starts = asyncio.Queue()
+    finish_first = asyncio.Event()
+
+    @asynccontextmanager
+    async def open_profile(profile, route, *, warming):
+        async def goto(*args, **kwargs):
+            starts.put_nowait((profile.name, now[0]))
+            if profile.name == "first":
+                await finish_first.wait()
+
+        yield SimpleNamespace(goto=goto, wait_for_selector=AsyncMock())
+
+    monkeypatch.setattr(pool._browsers, "open", open_profile)
+    monkeypatch.setattr(
+        identities,
+        "session_of",
+        AsyncMock(side_effect=lambda _: Session({"tt_chain_token": "new"}, "ua", "146")),
+    )
+    pool.configure(3, 3)
+    loop = asyncio.create_task(pool.run())
+    try:
+        assert await asyncio.wait_for(starts.get(), 1) == ("first", 100.0)
+        assert grants.await_args.kwargs["warm_bootstrap"] is True
+        pool.refresh(stale[1])
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(starts.get(), 0.03)
+        finish_first.set()
+        now[0] = 189.9
+        pool.refresh(stale[1])
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(starts.get(), 0.03)
+        grants.assert_awaited_once()
+        assert stale[0].listing_refresh_at is None and stale[0] in pool.available_for_crawl()
+        now[0] = 190
+        pool.refresh(stale[1])
+        assert await asyncio.wait_for(starts.get(), 1) == ("second", 190.0)
+        assert "warm_bootstrap" not in grants.await_args.kwargs
+    finally:
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+    assert release.await_count == 2
+
+
+async def test_scheduler_warm_wait_gates_wakes_and_releases_the_identity(
+    pressure_pool, monkeypatch
+):
+    pool, now = pressure_pool
+    identity = add(pool, "shared", warmed=False, busy=True)
+    pool._warming[identity.id] = identity
+    wait = Wait(180, "冷却期间等线路", code="warm_empty_wait")
+    monkeypatch.setattr(pool._scheduler, "lease", AsyncMock(side_effect=wait))
+    await pool._attempt(identity)
+    assert not identity.busy and pool._warming == {} and identity.warm_retry_at == 0
+    pool.configure(3, 3)
+    loop = asyncio.create_task(pool.run())
+    try:
+        now[0] = 279.9
+        pool.refresh(identity)
+        await asyncio.sleep(0.03)
+        pool._scheduler.lease.assert_awaited_once()
+    finally:
+        loop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop
+
+
+async def test_profile_protection_keeps_retired_directories_across_restore(pressure_pool):
+    pool, _ = pressure_pool
+    identity = add(pool, "001122334455")
+    pool.retire(identity, "策略测试")
+    await pool.persist()
+    [retired] = list(pool._store.save.call_args.args[0])
+    pool._store.records.return_value = [retired]
+    await pool.restore()
+    assert identity.id not in pool.identities
+    assert pool.profile(identity).is_dir()

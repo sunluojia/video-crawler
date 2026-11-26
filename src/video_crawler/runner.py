@@ -14,8 +14,9 @@ from uuid import uuid4
 import httpx
 from redis.exceptions import RedisError
 
-from video_crawler.errors import Gone, Retry, Wait
+from video_crawler.errors import CRAWL_WAIT_CODES, Gone, Retry, Wait, crawl_identity_hold
 from video_crawler.scheduler import DOWNLOAD, ClaimedTask, Scheduler
+from video_crawler.settings import Settings
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +39,15 @@ class Runner:
         available_identities: Callable[[], int],
         publish: Callable[[dict], Awaitable[None]],
         cached_download: Callable[[str | None], bool] | None = None,
+        available_crawl_identities: Callable[[], int] | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._scheduler, self._attempts, self._publish = scheduler, attempts, publish
         self._available_identities = available_identities
+        self._available_crawl_identities = available_crawl_identities
+        self._crawl_policy = bool(settings and settings.crawl_policy_enabled)
+        self._crawl_defer_max = settings.crawl_defer_max_seconds if settings else 30
+        self._crawl_pause = (0.0, "")
         self._cached_download = cached_download
         self.slots = slots.copy()
         """每类并发由心跳下发，调小时进行中的做完为止。"""
@@ -107,6 +114,8 @@ class Runner:
         for kind, until in self._claim_pause_until.items():
             if until > now:
                 capacity[kind] = 0
+        if self._crawl_pause[0] > now:
+            capacity[CRAWL_CREATOR] = 0
         return capacity
 
     def _pause_claims(self, retry_after: float, use: str | None = None) -> None:
@@ -116,9 +125,22 @@ class Runner:
         for kind in kinds:
             self._claim_pause_until[kind] = max(until, self._claim_pause_until.get(kind, until))
 
+    def _pause_crawl(self, wait: Wait) -> float:
+        seconds = max(wait.seconds, 1)
+        until = time.monotonic() + seconds
+        if until > self._crawl_pause[0]:
+            self._crawl_pause = until, wait.reason
+            log.info("采集认领暂停 %.1f 秒 [%s]：%s", seconds, wait.code, wait.reason)
+        return min(seconds, self._crawl_defer_max)
+
+    def _crawl_available(self, available: int) -> int:
+        if self._crawl_policy and self._available_crawl_identities is not None:
+            return min(available, self._available_crawl_identities())
+        return available
+
     def _ready_capacity(self, available: int) -> dict[str, int]:
         capacity = self._claim_capacity()
-        capacity[CRAWL_CREATOR] = min(capacity[CRAWL_CREATOR], available)
+        capacity[CRAWL_CREATOR] = min(capacity[CRAWL_CREATOR], self._crawl_available(available))
         if (
             capacity[DOWNLOAD_VIDEO]
             and not available
@@ -157,11 +179,18 @@ class Runner:
         controls: set[tuple[str, str]] = set()
         self._claim_controls = controls
         try:
-            claimed = await self._scheduler.claim(kinds)
+            if self._crawl_policy and kinds.get(CRAWL_CREATOR, 0):
+                claimed, wait = await self._scheduler.claim_with_wait(kinds)
+                if wait and wait.code in CRAWL_WAIT_CODES:
+                    self._pause_crawl(wait)
+            else:
+                claimed = await self._scheduler.claim(kinds)
         finally:
             self._claim_controls = None
         capacity, available = self._capacity(), self._available_identities()
+        crawl_ready = self._crawl_available(available)
         can_prepare = available > 0
+        counts = Counter(task.kind for task in claimed)
         for task in claimed:
             if task.attempt_id in self.running or task.attempt_id in self._returning:
                 continue
@@ -173,7 +202,18 @@ class Runner:
                     continue
                 # 调度中心允许新认领时，以其批次状态为准，补上可能漏收的恢复通知。
                 self.paused_batches.discard(task.batch_id)
-                has_identity = available > 0
+                until, reason = self._crawl_pause
+                remaining = until - time.monotonic()
+                if remaining > 0:
+                    self._return(task, reason, seconds=min(remaining, self._crawl_defer_max))
+                    counts[CRAWL_CREATOR] -= 1
+                    continue
+                if not crawl_ready and available > 0:
+                    wait = crawl_identity_hold()
+                    self._return(task, wait.reason, seconds=self._pause_crawl(wait))
+                    counts[CRAWL_CREATOR] -= 1
+                    continue
+                has_identity = crawl_ready > 0
             else:
                 work_id = task.body.get("work", {}).get("work_id")
                 has_identity = can_prepare or bool(
@@ -193,10 +233,11 @@ class Runner:
             capacity[task.kind] -= 1
             if task.kind == CRAWL_CREATOR:
                 available -= 1
-        return Counter(task.kind for task in claimed)
+                crawl_ready -= 1
+        return counts
 
-    def _return(self, task: ClaimedTask, reason: str) -> None:
-        job = asyncio.create_task(self._defer(task, 1, reason))
+    def _return(self, task: ClaimedTask, reason: str, *, seconds: float = 1) -> None:
+        job = asyncio.create_task(self._defer(task, seconds, reason))
         self._returning[task.attempt_id] = task, job
         job.add_done_callback(partial(self._finished, self._returning, task))
 
@@ -265,7 +306,14 @@ class Runner:
                 raise asyncio.CancelledError from error
             if isinstance(error, Wait):
                 retry_after = max(error.seconds, 1)
-                self._pause_claims(retry_after, error.use)
+                if (
+                    self._crawl_policy
+                    and task.kind == CRAWL_CREATOR
+                    and error.code in CRAWL_WAIT_CODES
+                ):
+                    retry_after = self._pause_crawl(error)
+                else:
+                    self._pause_claims(retry_after, error.use)
                 await self._defer(task, retry_after, error.reason)
                 return None
             if isinstance(error, Gone):

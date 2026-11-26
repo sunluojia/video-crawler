@@ -2,6 +2,7 @@
 
 import socket
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,6 +10,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SLOW_BYTES, SLOW_WINDOW = 20 * 1024, 45
 RANGE_PARTS, RANGE_MIN_BYTES = 4, 1024 * 1024
 MAX_VIDEO_HEIGHT = 720
+type BlockableResource = Literal["image", "media", "font"]
+BLOCKED_RESOURCE_TYPES: tuple[BlockableResource, ...] = ("image", "media", "font")
+BROWSER_CONTEXT_MAX_USES, BROWSER_CONTEXT_IDLE_TTL_SECONDS = 30, 600
 
 
 class Settings(BaseSettings):
@@ -31,7 +35,15 @@ class Settings(BaseSettings):
     crawl_policy_enabled: bool = False
     crawl_defer_max_seconds: int = Field(default=30, ge=1, le=30)
     crawl_empty_session_hold_seconds: int = Field(default=180, ge=0)
-    crawl_warm_recovery_min_seconds: int = Field(default=90, ge=0)
+    crawl_warm_recovery_min_seconds: int = Field(
+        default=90,
+        ge=0,
+        validation_alias=AliasChoices(
+            "VC_CRAWL_WARM_RECOVERY_MIN_SECONDS",
+            "VC_WARM_MIN_INTERVAL_SECONDS",
+            "crawl_warm_recovery_min_seconds",
+        ),
+    )
     keep_profile_dirs: bool = False
     download_slow_bytes: int = Field(default=SLOW_BYTES, gt=0)
     """下载断开阈值，单位是字节每秒。"""
@@ -48,6 +60,13 @@ class Settings(BaseSettings):
     )
     """优先下载的最高分辨率，横屏和竖屏均按短边计算。"""
     chrome_channel: str = "chrome"
+    block_nonessential_resources: bool = True
+    blocked_resource_types: tuple[BlockableResource, ...] = BLOCKED_RESOURCE_TYPES
+    reuse_browser_context: bool = True
+    browser_context_max_uses: int = Field(default=BROWSER_CONTEXT_MAX_USES, gt=0)
+    browser_context_idle_ttl_seconds: float = Field(
+        default=BROWSER_CONTEXT_IDLE_TTL_SECONDS, gt=0, allow_inf_nan=False
+    )
     warm_headless: bool = True
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到
     tt_chain_token，用无头预热出来的资料目录之后用有头采集完全正常（32 条，与有头预热一致）。

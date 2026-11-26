@@ -71,7 +71,15 @@ async def publish_event(broker: RedisBroker, item: dict) -> None:
 async def _serve(settings: Settings, redis: Redis) -> None:
     store = IdentityStore(redis, settings.instance_id, keep_profile_dirs=settings.preserve_profiles)
     scheduler = Scheduler(settings)
-    browsers = Browsers(settings.chrome_channel, warm_headless=settings.warm_headless)
+    browsers = Browsers(
+        settings.chrome_channel,
+        warm_headless=settings.warm_headless,
+        block_nonessential_resources=settings.block_nonessential_resources,
+        blocked_resource_types=settings.blocked_resource_types,
+        reuse_browser_context=settings.reuse_browser_context,
+        browser_context_max_uses=settings.browser_context_max_uses,
+        browser_context_idle_ttl_seconds=settings.browser_context_idle_ttl_seconds,
+    )
     pool = IdentityPool(settings, store, scheduler, browsers)
     await pool.restore()
     media_cache = tiktok.MediaCache()
@@ -148,14 +156,15 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         await server.serve()
     finally:
         # 停止续租，调度中心回收未完成的尝试，已入队的事件继续由 Redis 投递。
-        for job in background:
-            job.cancel()
-        await asyncio.gather(*background, *runner.stop(), return_exceptions=True)
         try:
+            for job in background:
+                job.cancel()
+            await asyncio.gather(*background, *runner.stop(), return_exceptions=True)
             await pool.persist()
         except RedisError as error:
             log.warning("退出时身份元数据写入 Redis 失败：%s", error)
-        await browsers.stop()
+        finally:
+            await browsers.stop()
         with contextlib.suppress(httpx.HTTPError):
             await scheduler.withdraw()
     if any(not job.cancelled() and job.exception() for job in background):

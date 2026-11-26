@@ -321,6 +321,7 @@ class IdentityPool:
             elif result == "empty_response":
                 identity.listing_fails += 1
                 if identity.listing_fails >= COUNTED_FAILS:
+                    self._browsers.invalidate(self.profile(identity))
                     if self._listing_hold:
                         identity.listing_refresh_at = time.monotonic() + self._listing_hold
                         self._wake.set()
@@ -376,6 +377,7 @@ class IdentityPool:
 
     def refresh(self, identity: Identity) -> None:
         """账号池页面要求立即刷新：当作过期，后台循环下一个就预热它。"""
+        self._browsers.invalidate(self.profile(identity))
         if identity.listing_refresh_at is None:
             identity.warmed_at = 0
         identity.warm_retry_at = 0

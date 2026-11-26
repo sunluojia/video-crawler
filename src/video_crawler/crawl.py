@@ -107,7 +107,9 @@ class Crawler:
         listing_result: ListingResult | None = None
         retry_after = None
         try:
-            async with self._browsers.open(self._pool.profile(identity), lease.route) as page:
+            async with self._browsers.open_crawl(
+                self._pool.profile(identity), lease.route, line=lease.line
+            ) as page:
                 result = await _read(
                     page,
                     task.body,
@@ -175,27 +177,35 @@ async def _read(
     max_video_height: int = MAX_VIDEO_HEIGHT,
 ) -> dict:
     pages: asyncio.Queue[ListingPage] = asyncio.Queue()
+    pending: set[asyncio.Task] = set()
+    observing = True
 
     async def on_response(response: Response) -> None:
-        if tiktok.ITEM_LIST not in response.url:
+        if not observing or tiktok.ITEM_LIST not in response.url:
             return
-        reply = await _listing_page(response, line)
-        content_bytes = None
-        if isinstance(reply, tuple):
-            content_bytes = len(reply[1])
-            note("list", content_bytes > 0)
-        log.info(
-            "listing_response %s",
-            json.dumps(
-                {
-                    "identity_id": identity_id,
-                    "line": line,
-                    "status": response.status,
-                    "content_bytes": content_bytes,
-                }
-            ),
-        )
-        pages.put_nowait(reply)
+        job = asyncio.current_task()
+        assert job is not None
+        pending.add(job)
+        try:
+            reply = await _listing_page(response, line)
+            content_bytes = None
+            if isinstance(reply, tuple):
+                content_bytes = len(reply[1])
+                note("list", content_bytes > 0)
+            log.info(
+                "listing_response %s",
+                json.dumps(
+                    {
+                        "identity_id": identity_id,
+                        "line": line,
+                        "status": response.status,
+                        "content_bytes": content_bytes,
+                    }
+                ),
+            )
+            pages.put_nowait(reply)
+        finally:
+            pending.discard(job)
 
     def on_request_failed(request: Request) -> None:
         failure = request.failure or ""
@@ -204,24 +214,33 @@ async def _read(
 
     page.on("response", on_response)  # 先开始监听，再打开主页
     page.on("requestfailed", on_request_failed)
-    conclusion, profile = await _read_profile(page, progress.handle, line)
-    if conclusion:
-        return {"conclusion": conclusion, "profile": profile}
-
-    listing = tiktok.Listing(
-        datetime.fromisoformat(body["cutoff"]),
-        progress.max_works,
-        on_media=on_media,
-        max_video_height=max_video_height,
-    )
     try:
-        works = await _read_listing(page, pages, listing, line, progress)
-    except ListingFailure as failure:
-        if await _needs_login(page):
-            return {"conclusion": "login_required", "profile": profile}
-        failure.profile = profile
-        raise
-    return {"conclusion": "ok", "profile": profile, "works": works}
+        conclusion, profile = await _read_profile(page, progress.handle, line)
+        if conclusion:
+            return {"conclusion": conclusion, "profile": profile}
+
+        listing = tiktok.Listing(
+            datetime.fromisoformat(body["cutoff"]),
+            progress.max_works,
+            on_media=on_media,
+            max_video_height=max_video_height,
+        )
+        try:
+            works = await _read_listing(page, pages, listing, line, progress)
+        except ListingFailure as failure:
+            if await _needs_login(page):
+                return {"conclusion": "login_required", "profile": profile}
+            failure.profile = profile
+            raise
+        return {"conclusion": "ok", "profile": profile, "works": works}
+    finally:
+        observing = False
+        page.remove_listener("response", on_response)
+        page.remove_listener("requestfailed", on_request_failed)
+        if pending:
+            for job in pending:
+                job.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def _listing_page(response: Response, line: str) -> ListingPage:

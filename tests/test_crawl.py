@@ -96,13 +96,15 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
             "1", "2", [item("7", -1), item("6", -2, imagePost={"images": []})], more=False
         )
 
-    page = SimpleNamespace(on=handler, goto=goto, mouse=SimpleNamespace(wheel=wheel))
+    page = SimpleNamespace(
+        on=handler, remove_listener=Mock(), goto=goto, mouse=SimpleNamespace(wheel=wheel)
+    )
 
     @asynccontextmanager
-    async def open_browser(profile, route):
+    async def open_browser(profile, route, *, line):
         yield page
 
-    browsers = SimpleNamespace(open=Mock(side_effect=open_browser))
+    browsers = SimpleNamespace(open_crawl=Mock(side_effect=open_browser))
     media_cache = tiktok.MediaCache()
     crawler = crawl.Crawler(
         pool, scheduler, browsers, media_cache=media_cache, max_video_height=540
@@ -152,7 +154,10 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
             job.cancel()
             await asyncio.gather(job, return_exceptions=True)
 
-    browsers.open.assert_called_once()
+    browsers.open_crawl.assert_called_once_with(
+        pool.profile(identity), lease.route, line=lease.line
+    )
+    assert page.remove_listener.call_args_list == handler.call_args_list
     scheduler.lease.assert_awaited_once_with(CRAWL, task.task_id, [], attempt_id=task.attempt_id)
     scheduler.release.assert_awaited_once_with(
         lease, "normal", None, None, listing_result="complete"
@@ -165,7 +170,7 @@ async def test_profile_and_listing_progress_use_the_same_browser_and_keep_early_
 async def test_listing_is_skipped_for_private_or_missing_creators(monkeypatch, conclusion):
     progress = crawl.CrawlProgress("task", "alice", 5, stage="profile")
     monkeypatch.setattr(crawl, "_read_profile", AsyncMock(return_value=(conclusion, None)))
-    page = SimpleNamespace(on=Mock())
+    page = SimpleNamespace(on=Mock(), remove_listener=Mock())
     assert await crawl._read(page, {}, "direct:test", Mock(), progress, identity_id="visitor") == {
         "conclusion": conclusion,
         "profile": None,
@@ -191,16 +196,17 @@ def listing_attempt(monkeypatch):
     handlers = {}
     page = SimpleNamespace(
         on=lambda event, callback: handlers.update({event: callback}),
+        remove_listener=lambda event, _: handlers.pop(event),
         reload=AsyncMock(),
         mouse=SimpleNamespace(wheel=AsyncMock()),
         evaluate=AsyncMock(return_value="Videos Reposts Liked"),
     )
 
     @asynccontextmanager
-    async def open_browser(profile, route):
+    async def open_browser(profile, route, *, line):
         yield page
 
-    browsers = SimpleNamespace(open=open_browser)
+    browsers = SimpleNamespace(open_crawl=open_browser)
     monkeypatch.setattr(crawl, "session_of", AsyncMock(return_value=None))
     crawler = crawl.Crawler(pool, scheduler, browsers)
 
@@ -219,6 +225,35 @@ def listing_attempt(monkeypatch):
         with_profile=with_profile,
         run=crawler,
     )
+
+
+async def test_crawl_removes_listeners_and_cancels_in_flight_body_reads(listing_attempt):
+    attempt = listing_attempt
+    started = asyncio.Event()
+
+    async def read_body():
+        started.set()
+        await asyncio.Future()
+
+    response = SimpleNamespace(
+        url="https://www.tiktok.com/api/post/item_list/?cursor=0",
+        status=200,
+        body=AsyncMock(side_effect=read_body),
+    )
+    callbacks, jobs = [], []
+
+    async def read_profile(*args, **kwargs):
+        callbacks.append(attempt.handlers["response"])
+        jobs.append(asyncio.create_task(callbacks[0](response)))
+        await asyncio.wait_for(started.wait(), 1)
+        return "private", None
+
+    attempt.with_profile(read_profile)
+    assert (await attempt.run(attempt.task))["conclusion"] == "private"
+    assert jobs[0].cancelled() and not attempt.handlers
+    await callbacks[0](response)  # 已排队但还未执行的监听器也必须停止。
+    response.body.assert_awaited_once()
+    attempt.note.assert_not_called()
 
 
 @pytest.mark.parametrize(

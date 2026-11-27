@@ -561,3 +561,45 @@ async def test_windows_cleanup_error_keeps_the_original_failure(attempt, caplog,
         await attempt.run(attempt.task)
     assert "无法清理下载文件" in caplog.text
     assert not attempt.run.progress()
+
+
+async def test_download_uses_shared_redis_media_cache_and_falls_back_on_403(attempt):
+    store: dict[str, str] = {}
+
+    class FakeRedis:
+        def setex(self, key, ttl, value):
+            assert ttl > 0
+            store[key] = value
+
+        def get(self, key):
+            return store.get(key)
+
+        def delete(self, key):
+            store.pop(key, None)
+
+    redis = FakeRedis()
+    writer = tiktok.MediaCache(redis=redis)
+    reader = tiktok.MediaCache(redis=redis)
+    cached_url = "https://v16.tiktokcdn.com/shared-direct"
+    writer.share("7", [cached_url], ("UA", "test"))
+    attempt.run._media = reader
+
+    # 跨机命中共享缓存：直接下载，不申请采集线路也不调作品页。
+    await attempt.run(attempt.task)
+    assert attempt.trace == [
+        ("lease", "HK"),
+        ("fetch", cached_url),
+        ("release", "HK", "normal"),
+        ("upload",),
+    ]
+    attempt.curl_get.assert_not_awaited()
+
+    # 若共享直链返回 403，自动删除共享键并无感回退到 _prepare 重新取链，不扣本机身份。
+    attempt.trace.clear()
+    writer.share("7", [cached_url], ("UA", "test"))
+    attempt.outcomes[cached_url] = download.Stop("视频服务器拒绝（403）", blocked=True, stale=True)
+    await attempt.run(attempt.task)
+    assert "video-crawler:media:7" not in store
+    assert ("fetch", cached_url) in attempt.trace
+    assert ("fetch", FRESH) in attempt.trace
+    attempt.pool.record_download.assert_called_once()

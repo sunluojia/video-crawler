@@ -31,6 +31,10 @@ log = logging.getLogger(__name__)
 BLANK = "about:blank"
 
 
+def _route_key(route: dict, line: str) -> tuple[str, bytes]:
+    return line, sha256(json.dumps(route, sort_keys=True).encode()).digest()
+
+
 @dataclass
 class Session:
     """浏览器会话里取出来的东西，只放在内存里。"""
@@ -89,7 +93,7 @@ class Browsers:
             blocked_resource_types if block_nonessential_resources else ()
         )
         self.limit = 0
-        """同时开的 Chrome 上限：采集并发加预热并发，随心跳调整。"""
+        """采集并发加预热并发，随心跳调整；为 0 时关闭空闲 Chrome。"""
         self._open = 0
         self._changed = asyncio.Event()
         self._stopping = False
@@ -148,12 +152,9 @@ class Browsers:
     @asynccontextmanager
     async def _slot(self) -> AsyncIterator[None]:
         """空闲 Chrome 也占槽；有新的使用者时，先腾出最久未用的槽位。"""
-        while not self._stopping and self._open >= self.limit:
-            if (
-                self.limit
-                and self._open - self._closing_count() >= self.limit
-                and (idle := self._oldest_idle())
-            ):
+        # 即使停了采集和预热，已领任务仍需要一个槽完成下载取链等操作。
+        while not self._stopping and self._open >= (limit := max(1, self.limit)):
+            if self._open - self._closing_count() >= limit and (idle := self._oldest_idle()):
                 self._close_hot(*idle[0])
             await self._wait_for_change()
         if self._stopping:
@@ -191,6 +192,21 @@ class Browsers:
             hot.failed = True
             if hot.idle_timer is not None:
                 self._close_hot(key, hot)
+
+    def hot_profiles_for(self, route: dict, *, line: str) -> set[Path]:
+        """返回当前空闲、健康且已绑定到同一线路和代理配置的热上下文资料目录。"""
+        if not self._reuse_context or not self._hot:
+            return set()
+        route_key = _route_key(route, line)
+        now = asyncio.get_running_loop().time()
+        return {
+            key
+            for key, hot in self._hot.items()
+            if key not in self._borrowed
+            and hot.healthy
+            and hot.route_key == route_key
+            and (hot.idle_timer is None or hot.idle_timer.when() > now)
+        }
 
     def _close_hot(self, key: Path, hot: _HotContext) -> asyncio.Task[None]:
         if hot.closing is None:
@@ -301,7 +317,7 @@ class Browsers:
 
     @asynccontextmanager
     async def _open_hot(self, profile: Path, route: dict, line: str) -> AsyncIterator[Page]:
-        route_key = line, sha256(json.dumps(route, sort_keys=True).encode()).digest()
+        route_key = _route_key(route, line)
         async with self._reserve(profile) as (key, hot):
             if hot is not None and (not hot.healthy or hot.route_key != route_key):
                 await asyncio.shield(self._close_hot(key, hot))

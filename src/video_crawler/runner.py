@@ -412,9 +412,17 @@ class Runner:
     def _count(self, task: ClaimedTask, ok: bool) -> None:
         if task.kind != DOWNLOAD_VIDEO:
             return
-        self._streak = 0 if ok else self._streak + 1
+        if ok:
+            self._streak = 0
+            self.paused_until = 0.0
+            return
+        now = time.time()
+        if self.paused_until > now:
+            # 同一波在途并发失败不再把本次暂停从 60 秒瞬间指数叠到 8–10 分钟。
+            return
+        self._streak += 1
         if self._streak >= PAUSE_AFTER:
-            self.paused_until = time.time() + min(60 * 2 ** (self._streak - PAUSE_AFTER), MAX_PAUSE)
+            self.paused_until = now + min(60 * 2 ** (self._streak - PAUSE_AFTER), MAX_PAUSE)
             log.warning(
                 "下载连续 %s 次没成，设备暂停到 %s", self._streak, time.ctime(self.paused_until)
             )

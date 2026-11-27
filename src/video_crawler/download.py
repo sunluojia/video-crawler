@@ -209,8 +209,17 @@ class Downloader:
 
     async def _download(self, task: ClaimedTask, progress: DownloadProgress, path: Path) -> None:
         cached = self._media.get(progress.work_id)
+        credentials = (
+            self._pool.download_credentials(cached.identity_id)
+            if cached and cached.identity_id
+            else None
+        )
+        if credentials is None and hasattr(self._media, "get_shared"):
+            shared = await asyncio.to_thread(self._media.get_shared, progress.work_id)
+            if shared and shared.credentials:
+                cached, credentials = shared, shared.credentials
         sha256 = None
-        if cached and (credentials := self._pool.download_credentials(cached.identity_id)):
+        if cached and credentials:
             sha256 = await self._fetch_media(
                 task, credentials, cached.identity_id, cached.urls, path, progress, cached=cached
             )
@@ -285,14 +294,14 @@ class Downloader:
                 return sha256
             except Stop as stop:
                 blocked = stop.blocked
-                if cached and stop.stale:
+                if cached and (stop.stale or (not identity_id and stop.blocked)):
                     stale_cached = True
-                    self._media.discard(progress.work_id, cached)
+                    await asyncio.to_thread(self._media.discard, progress.work_id, cached)
                     return None
                 raise
             finally:
-                if stale_cached:
-                    # 过期直链的 403 计入下载统计，身份是否被拒以重新取链的结果为准。
+                if stale_cached or not identity_id:
+                    # 过期或跨机共享直链只计入下载统计，不扣本机身份失败次数。
                     self._pool.note("download", not blocked)
                 else:
                     self._pool.record_download(

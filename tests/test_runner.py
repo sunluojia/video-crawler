@@ -440,9 +440,18 @@ async def test_five_failed_downloads_pause_the_device():
     runner = run_with(scheduler, AsyncMock(side_effect=Retry("连不上视频服务器")))
     for number in range(5):
         await runner.attempt(task(task_id=f"download-{number}"))
-    assert runner.paused_until > time.time() + 50
+    first_pause = runner.paused_until
+    assert first_pause > time.time() + 50
     await runner._fill()
     assert DOWNLOAD_VIDEO not in scheduler.claim.await_args.args[0]
+
+    # 暂停期间同波在途失败不再把暂停时间指数叠高；一旦有任意成功则立刻解冻。
+    for number in range(5, 8):
+        await runner.attempt(task(task_id=f"download-{number}"))
+    assert runner.paused_until == first_pause
+    runner._attempts[DOWNLOAD_VIDEO] = AsyncMock(return_value=None)
+    await runner.attempt(task(task_id="download-ok"))
+    assert runner.paused_until == 0.0 and runner._streak == 0
 
 
 async def test_one_idle_identity_alternates_between_crawl_and_download():
@@ -628,6 +637,40 @@ async def test_heartbeat_changes_slots_and_cancels_the_revoked_attempt():
         pool.configure.assert_called_once_with(6, 1)
         assert [event["type"] for event in events(publish)] == ["accepted"]
         scheduler.defer.assert_not_awaited()
+    finally:
+        await cancel_jobs(runner, beat)
+
+
+@pytest.mark.parametrize(
+    ("download_slots", "reported_warm_slots", "warm_slots"), [(0, 0, 0), (3, 0, 0), (0, None, 1)]
+)
+async def test_heartbeat_preserves_zero_slots(download_slots, reported_warm_slots, warm_slots):
+    scheduler = server()
+    scheduler.register = AsyncMock(
+        return_value={
+            "crawl_slots": 0,
+            "download_slots": download_slots,
+            "warm_slots": reported_warm_slots,
+            "identity_target": 6,
+        }
+    )
+    configured = asyncio.Event()
+    pool = SimpleNamespace(
+        snapshot=Mock(), configure=Mock(side_effect=lambda *_: configured.set()), warm_slots=2
+    )
+    browsers = Browsers("chrome")
+    runner = run_with(scheduler, AsyncMock())
+    beat = asyncio.create_task(heartbeat(scheduler, "http://crawler", runner, pool, browsers))
+    try:
+        await asyncio.wait_for(configured.wait(), 1)
+        pool.configure.assert_called_once_with(6, warm_slots)
+        assert runner.slots == {CRAWL_CREATOR: 0, DOWNLOAD_VIDEO: download_slots}
+        assert browsers.limit == warm_slots
+        await runner._fill()
+        if download_slots:
+            scheduler.claim.assert_awaited_once_with({DOWNLOAD_VIDEO: download_slots})
+        else:
+            scheduler.claim.assert_not_awaited()
     finally:
         await cancel_jobs(runner, beat)
 

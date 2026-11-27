@@ -7,17 +7,23 @@
 """
 
 import json
+import logging
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from math import inf
 from operator import itemgetter
 from urllib.parse import parse_qs, urlsplit
 
+from redis import Redis
+from redis.exceptions import RedisError
+
 from video_crawler.settings import MAX_VIDEO_HEIGHT
+
+log = logging.getLogger(__name__)
 
 HOME = "https://www.tiktok.com/"
 DATA_ID = "__UNIVERSAL_DATA_FOR_REHYDRATION__"
@@ -267,24 +273,85 @@ class MediaLinks:
     identity_id: str
     urls: tuple[str, ...]
     cached_at: float
+    credentials: tuple[str, str] | None = None
 
 
 class MediaCache:
-    """本进程短时复用列表里的媒体候选。只记录身份 ID，不存 Cookie。"""
+    """短时复用列表里的媒体候选；配置 Redis 时跨设备共享短期直链与匿名会话凭据。"""
 
-    def __init__(self, ttl: float = 8 * 60, limit: int = 2000) -> None:
+    def __init__(
+        self,
+        ttl: float = 8 * 60,
+        limit: int = 2000,
+        *,
+        redis: Redis | None = None,
+        key_prefix: str = "video-crawler:media:",
+    ) -> None:
         self._ttl, self._limit = ttl, limit
+        self._redis, self._prefix = redis, key_prefix
         self._entries: OrderedDict[str, MediaLinks] = OrderedDict()
 
-    def remember(self, identity_id: str, work_id: str, urls: list[str]) -> None:
+    def _key(self, work_id: str) -> str:
+        return f"{self._prefix}{work_id}"
+
+    def remember(
+        self,
+        identity_id: str,
+        work_id: str,
+        urls: list[str],
+        *,
+        credentials: tuple[str, str] | None = None,
+    ) -> None:
         now = time.monotonic()
-        self._entries[work_id] = MediaLinks(identity_id, tuple(urls), now)
+        self._entries[work_id] = MediaLinks(identity_id, tuple(urls), now, credentials)
         self._entries.move_to_end(work_id)
         self._prune(now)
+
+    def share(self, work_id: str, urls: Sequence[str], credentials: tuple[str, str]) -> None:
+        if self._redis is None or not urls or not credentials[1]:
+            return
+        payload = json.dumps(
+            {"urls": list(urls), "user_agent": credentials[0], "token": credentials[1]}
+        )
+        try:
+            self._redis.setex(self._key(work_id), max(1, int(self._ttl)), payload)
+        except RedisError as error:
+            log.debug("写入共享直链缓存失败：%s", error)
 
     def get(self, work_id: str) -> MediaLinks | None:
         self._prune(time.monotonic())
         return self._entries.get(work_id)
+
+    def get_shared(self, work_id: str) -> MediaLinks | None:
+        if self._redis is None:
+            return None
+        try:
+            raw = self._redis.get(self._key(work_id))
+        except RedisError as error:
+            log.debug("读取共享直链缓存失败：%s", error)
+            return None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        urls = data.get("urls")
+        user_agent = data.get("user_agent")
+        token = data.get("token")
+        if (
+            not isinstance(urls, list)
+            or not urls
+            or not all(isinstance(u, str) and u for u in urls)
+            or not isinstance(user_agent, str)
+            or not user_agent
+            or not isinstance(token, str)
+            or not token
+        ):
+            return None
+        return MediaLinks("", tuple(urls), time.monotonic(), (user_agent, token))
 
     def has_usable(self, usable_identity: Callable[[str], bool]) -> bool:
         self._prune(time.monotonic())
@@ -293,6 +360,11 @@ class MediaCache:
     def discard(self, work_id: str, links: MediaLinks) -> None:
         if self._entries.get(work_id) is links:
             del self._entries[work_id]
+        if self._redis is not None and links.credentials is not None:
+            try:
+                self._redis.delete(self._key(work_id))
+            except RedisError as error:
+                log.debug("清理共享直链缓存失败：%s", error)
 
     def _prune(self, now: float) -> None:
         while self._entries:

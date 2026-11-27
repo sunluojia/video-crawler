@@ -13,6 +13,7 @@ MAX_VIDEO_HEIGHT = 720
 type BlockableResource = Literal["image", "media", "font"]
 BLOCKED_RESOURCE_TYPES: tuple[BlockableResource, ...] = ("image", "media", "font")
 BROWSER_CONTEXT_MAX_USES, BROWSER_CONTEXT_IDLE_TTL_SECONDS = 30, 600
+BROWSER_CONTEXT_POOL_SIZE = 6
 
 
 class Settings(BaseSettings):
@@ -63,10 +64,12 @@ class Settings(BaseSettings):
     block_nonessential_resources: bool = True
     blocked_resource_types: tuple[BlockableResource, ...] = BLOCKED_RESOURCE_TYPES
     reuse_browser_context: bool = True
+    browser_context_pool_size: int = Field(default=BROWSER_CONTEXT_POOL_SIZE, ge=0)
     browser_context_max_uses: int = Field(default=BROWSER_CONTEXT_MAX_USES, gt=0)
     browser_context_idle_ttl_seconds: float = Field(
         default=BROWSER_CONTEXT_IDLE_TTL_SECONDS, gt=0, allow_inf_nan=False
     )
+    shared_media_cache: bool = True
     warm_headless: bool = True
     """预热身份时用无头 Chrome（默认开）。只影响拿 Cookie 那一步：实测无头 6 秒就能拿到
     tt_chain_token，用无头预热出来的资料目录之后用有头采集完全正常（32 条，与有头预热一致）。

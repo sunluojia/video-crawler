@@ -373,6 +373,9 @@ async def test_idle_contexts_make_room_for_other_profiles_and_limit_changes(
         await manager.resize(0)
         await second.context.closed.wait()
     assert download.context.closed.is_set()
+    async with asyncio.timeout(1), manager.open(tmp_path / "next-download", DIRECT) as next_page:
+        assert not next_page.context.closed.is_set()
+    assert next_page.context.closed.is_set()
 
 
 async def test_shutdown_closes_idle_and_borrowed_contexts_before_stopping_the_driver(
@@ -550,3 +553,46 @@ def test_warm_recovery_interval_compatibility_alias(monkeypatch):
     assert Settings(_env_file=None, service_token="test").crawl_warm_recovery_min_seconds == 147
     monkeypatch.setenv("VC_CRAWL_WARM_RECOVERY_MIN_SECONDS", "175")
     assert Settings(_env_file=None, service_token="test").crawl_warm_recovery_min_seconds == 175
+
+
+async def test_crawler_prefers_identity_with_hot_context_for_leased_line(
+    make_browser, tmp_path, monkeypatch
+):
+    manager, runtime = await make_browser(limit=6)
+    settings = Settings(_env_file=None, service_token="test", profile_root=tmp_path)
+    store = SimpleNamespace(records=Mock(return_value=[]), save=Mock())
+    scheduler = SimpleNamespace(lease=AsyncMock(), release=AsyncMock())
+    pool = IdentityPool(settings, store, scheduler, manager)
+    pool.browser = "146"
+    now = time.time()
+    cold = Identity("111111111111", browser="146", warmed_at=now, last_used_at=now - 100)
+    warm = Identity("222222222222", browser="146", warmed_at=now, last_used_at=now - 10)
+    cold.session = Session({"tt_chain_token": "tok-cold"}, "UA", "146")
+    warm.session = Session({"tt_chain_token": "tok-warm"}, "UA", "146")
+    pool.identities[cold.id] = cold
+    pool.identities[warm.id] = warm
+
+    # 先让 warm 在 line-a 上建立一个热上下文；即使 cold 更久未用，也应优先复用 warm。
+    async with manager.open_crawl(pool.profile(warm), PROXY, line="line-a"):
+        pass
+    assert manager.hot_profiles_for(PROXY, line="line-a") == {pool.profile(warm).resolve()}
+
+    lease = Lease("l1", "line-a", PROXY)
+    scheduler.lease.return_value = lease
+    monkeypatch.setattr(crawl, "session_of", AsyncMock(return_value=warm.session))
+    monkeypatch.setattr(
+        crawl,
+        "_read",
+        AsyncMock(return_value={"conclusion": "ok", "works": [], "profile": {}}),
+    )
+    crawler = crawl.Crawler(pool, scheduler, manager)
+    task = ClaimedTask(
+        "t1",
+        "crawl_creator",
+        1,
+        "a1",
+        {"creator": {"handle": "alice"}, "max_works": 5},
+    )
+    await crawler(task)
+    assert runtime.chromium.launch_persistent_context.await_count == 1
+    assert crawl._read.await_args.kwargs["identity_id"] == warm.id

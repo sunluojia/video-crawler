@@ -11,7 +11,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from functools import partial
 from math import ceil
 from typing import Literal
 
@@ -82,6 +81,12 @@ class Crawler:
     def progress(self) -> list[CrawlProgress]:
         return list(self._active.values())
 
+    def _share_media(
+        self, items: list[tuple[str, list[str]]], credentials: tuple[str, str]
+    ) -> None:
+        for work_id, urls in items:
+            self._media.share(work_id, urls, credentials)
+
     async def __call__(self, task: ClaimedTask) -> dict:
         """一次尝试，返回 crawled 事件的内容。"""
         progress = CrawlProgress(
@@ -94,18 +99,48 @@ class Crawler:
             self._active.pop(task.attempt_id, None)
 
     async def _collect(self, task: ClaimedTask, progress: CrawlProgress) -> dict:
-        identity = self._pool.take(for_listing=True)
-        try:
+        hot_profiles_for = getattr(self._browsers, "hot_profiles_for", None)
+        available_for_crawl = getattr(self._pool, "available_for_crawl", None)
+        if hot_profiles_for is not None and available_for_crawl is not None:
+            if not available_for_crawl():
+                self._pool.take(for_listing=True)
             lease = await self._scheduler.lease(
                 CRAWL, task.task_id, task.avoid, attempt_id=task.attempt_id
             )
-        except BaseException:
-            self._pool.give_back(identity)
-            raise
+            hot_paths = hot_profiles_for(lease.route, line=lease.line)
+            preferred = (
+                {
+                    item.id
+                    for item in available_for_crawl()
+                    if self._pool.profile(item).resolve() in hot_paths
+                }
+                if hot_paths
+                else ()
+            )
+            try:
+                identity = self._pool.take(for_listing=True, preferred_ids=preferred)
+            except BaseException:
+                await self._scheduler.release(lease, "normal")
+                raise
+        else:
+            identity = self._pool.take(for_listing=True)
+            try:
+                lease = await self._scheduler.lease(
+                    CRAWL, task.task_id, task.avoid, attempt_id=task.attempt_id
+                )
+            except BaseException:
+                self._pool.give_back(identity)
+                raise
         progress.stage = "profile"
         outcome, detail, session = "suspect", None, None
         listing_result: ListingResult | None = None
         retry_after = None
+        captured_media: list[tuple[str, list[str]]] = []
+
+        def remember_media(work_id: str, urls: list[str]) -> None:
+            self._media.remember(identity.id, work_id, urls)
+            captured_media.append((work_id, urls))
+
         try:
             async with self._browsers.open_crawl(
                 self._pool.profile(identity), lease.route, line=lease.line
@@ -117,10 +152,14 @@ class Crawler:
                     self._pool.note,
                     progress,
                     identity_id=identity.id,
-                    on_media=partial(self._media.remember, identity.id),
+                    on_media=remember_media,
                     max_video_height=self._max_video_height,
                 )
                 session = await session_of(page)
+            if session and session.token and captured_media and hasattr(self._media, "share"):
+                await asyncio.to_thread(
+                    self._share_media, captured_media, (session.user_agent, session.token)
+                )
             outcome = "normal"
             if result["conclusion"] == "ok":
                 listing_result = "complete"

@@ -11,6 +11,7 @@ import re
 import shutil
 import time
 from collections import Counter, deque
+from collections.abc import Collection
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -256,8 +257,14 @@ class IdentityPool:
     def available_for_crawl(self) -> list[Identity]:
         return [identity for identity in self.available() if identity.listing_refresh_at is None]
 
-    def take(self, *, preferred_id: str | None = None, for_listing: bool = False) -> Identity:
-        """优先用指定的空闲身份，其次按连续失败次数和上次使用时间排序。"""
+    def take(
+        self,
+        *,
+        preferred_id: str | None = None,
+        preferred_ids: Collection[str] = (),
+        for_listing: bool = False,
+    ) -> Identity:
+        """优先用指定的空闲身份（含同线路热上下文身份），其次按连续失败次数和上次使用时间排序。"""
         ready = self.available()
         if not ready:
             raise Wait(10, "没有可用身份")
@@ -269,6 +276,7 @@ class IdentityPool:
             ready,
             key=lambda item: (
                 item.id != preferred_id,
+                item.id not in preferred_ids,
                 item.consecutive_failures,
                 item.last_used_at,
             ),

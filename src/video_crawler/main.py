@@ -31,7 +31,13 @@ VERSION = version("video-crawler")
 
 
 async def heartbeat(
-    scheduler: Scheduler, url: str, runner: Runner, pool: IdentityPool, browsers: Browsers
+    scheduler: Scheduler,
+    url: str,
+    runner: Runner,
+    pool: IdentityPool,
+    browsers: Browsers,
+    *,
+    pool_size: int = 0,
 ) -> None:
     while True:
         try:
@@ -41,7 +47,9 @@ async def heartbeat(
                 CRAWL_CREATOR: reply["crawl_slots"],
                 DOWNLOAD_VIDEO: reply["download_slots"],
             }
-            warm_slots = reply.get("warm_slots") or 1
+            warm_slots = reply.get("warm_slots")
+            if warm_slots is None:
+                warm_slots = 1
             if slots != runner.slots or warm_slots != pool.warm_slots:
                 log.info(
                     "并发：同时获取作品 %s 个，同时下载 %s 个，同时预热 %s 个",
@@ -49,7 +57,9 @@ async def heartbeat(
                     slots[DOWNLOAD_VIDEO],
                     warm_slots,
                 )
-                await browsers.resize(slots[CRAWL_CREATOR] + warm_slots)
+                active_browsers = slots[CRAWL_CREATOR] + warm_slots
+                browser_limit = max(active_browsers, pool_size) if active_browsers else 0
+                await browsers.resize(browser_limit)
                 runner.slots.update(slots)
                 runner.wake()
             pool.configure(reply["identity_target"] or 0, warm_slots)
@@ -82,7 +92,7 @@ async def _serve(settings: Settings, redis: Redis) -> None:
     )
     pool = IdentityPool(settings, store, scheduler, browsers)
     await pool.restore()
-    media_cache = tiktok.MediaCache()
+    media_cache = tiktok.MediaCache(redis=redis if settings.shared_media_cache else None)
     crawler = Crawler(
         pool,
         scheduler,
@@ -137,11 +147,14 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         )
     )
     await browsers.start()
+    pool_size = settings.browser_context_pool_size if settings.reuse_browser_context else 0
     background = [
         asyncio.create_task(runner.run()),
         asyncio.create_task(pool.run()),
         asyncio.create_task(pool.persist_loop()),
-        asyncio.create_task(heartbeat(scheduler, settings.url, runner, pool, browsers)),
+        asyncio.create_task(
+            heartbeat(scheduler, settings.url, runner, pool, browsers, pool_size=pool_size)
+        ),
     ]
 
     def stopped(job: asyncio.Task) -> None:

@@ -4,16 +4,19 @@ import time
 from contextlib import asynccontextmanager
 from errno import ENOSPC
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
+from httpx import RemoteProtocolError
 
 from video_crawler import download, tiktok
 from video_crawler.browser import Session
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import Identity, IdentityPool
+from video_crawler.preextract import Bundle
 from video_crawler.runner import DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease
 from video_crawler.settings import Settings
@@ -292,8 +295,16 @@ async def test_a_page_failure_does_not_request_or_penalize_the_download_line(att
         ),
     ],
     ids=[
-        "deleted", "private-post", "private-account", "private-notice", "login", "age",
-        "private-flag", "anchors", "anchor-types", "no-address",
+        "deleted",
+        "private-post",
+        "private-account",
+        "private-notice",
+        "login",
+        "age",
+        "private-flag",
+        "anchors",
+        "anchor-types",
+        "no-address",
     ],
 )
 async def test_curl_content_failure_is_terminal_without_chrome(
@@ -603,3 +614,58 @@ async def test_download_uses_shared_redis_media_cache_and_falls_back_on_403(atte
     assert ("fetch", cached_url) in attempt.trace
     assert ("fetch", FRESH) in attempt.trace
     attempt.pool.record_download.assert_called_once()
+
+
+@pytest.mark.parametrize("outcome", ["uploaded", "extraction_failed", "upload_failed", "cancelled"])
+async def test_preextract_upload_and_cancellation_clean_up(attempt, monkeypatch, outcome):
+    transfer = download.transfer
+    upload_started = asyncio.Event()
+    raw_dir = attempt.run._folder
+
+    async def save_original(client, url, path, progress, **options):
+        digest = await transfer(client, url, path, progress, **options)
+        path.write_bytes(b"original MP4")
+        return digest
+
+    async def create_bundle(path, target, original_sha256):
+        assert original_sha256 == "digest"
+        assert path.read_bytes() == b"original MP4"
+        with TemporaryDirectory(dir=raw_dir) as scratch:
+            (Path(scratch) / "frame.jpg").write_bytes(b"frame")
+            target.write_bytes(b"tar")
+            if outcome == "extraction_failed":
+                raise RuntimeError("FFmpeg failed")
+        return Bundle(3, "tar-hash", 0.05)
+
+    async def upload(task, path, sha256):
+        assert task == attempt.task
+        assert path.name == "task-1-attempt.tar" and sha256 == "tar-hash"
+        assert list(raw_dir.iterdir()) == [path]
+        assert path.read_bytes() == b"tar"
+        upload_started.set()
+        if outcome == "upload_failed":
+            raise RemoteProtocolError("disconnected")
+        if outcome == "cancelled":
+            await asyncio.Future()
+        return 204
+
+    monkeypatch.setattr(download, "transfer", save_original)
+    attempt.run._preextractor = SimpleNamespace(create=create_bundle)
+    attempt.scheduler.upload.side_effect = upload
+    if outcome == "extraction_failed":
+        with pytest.raises(RuntimeError, match="FFmpeg failed"):
+            await attempt.run(attempt.task)
+        attempt.scheduler.upload.assert_not_awaited()
+    elif outcome == "upload_failed":
+        with pytest.raises(Wait, match="上传时调度中心连不上"):
+            await attempt.run(attempt.task)
+    elif outcome == "cancelled":
+        job = asyncio.create_task(attempt.run(attempt.task))
+        await asyncio.wait_for(upload_started.wait(), timeout=5)
+        job.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await job
+    else:
+        await attempt.run(attempt.task)
+        attempt.scheduler.upload.assert_awaited_once()
+    assert not list(raw_dir.iterdir())

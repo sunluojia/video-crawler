@@ -28,6 +28,7 @@ from video_crawler.browser import Browsers, Session, page_data, session_of
 from video_crawler.crawl import retry_after_seconds
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import DownloadCredentials, Identity, IdentityPool
+from video_crawler.preextract import Bundle, Preextractor
 from video_crawler.routes import proxy_reachable, proxy_url
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease, Scheduler
 from video_crawler.settings import (
@@ -165,9 +166,10 @@ class Downloader:
         slow_window: float = SLOW_WINDOW,
         range_parts: int = RANGE_PARTS,
         range_min_bytes: int = RANGE_MIN_BYTES,
+        preextractor: Preextractor | None = None,
     ) -> None:
         self._pool, self._scheduler, self._browsers = pool, scheduler, browsers
-        self._folder = folder
+        self._folder, self._preextractor = folder, preextractor
         self._media = media_cache or tiktok.MediaCache()
         self._max_video_height = max_video_height
         self._slow_bytes, self._slow_window = slow_bytes, slow_window
@@ -230,11 +232,51 @@ class Downloader:
                 task, credentials, identity_id, candidates, path, progress
             )
         assert sha256 is not None
+        if self._preextractor is None:
+            await self._upload(task, progress, path, sha256)
+            return
+
+        bundle_path = path.with_suffix(".tar")
+        try:
+            original_size = path.stat().st_size
+            started = time.monotonic()
+            bundle = await self._preextractor.create(path, bundle_path, sha256)
+            path.unlink()
+            prepare_seconds = time.monotonic() - started
+            await self._upload(
+                task, progress, bundle_path, bundle.sha256,
+                metrics=(original_size, bundle, prepare_seconds),
+            )  # fmt: skip
+        finally:
+            _remove_file(bundle_path)
+
+    async def _upload(
+        self,
+        task: ClaimedTask,
+        progress: DownloadProgress,
+        path: Path,
+        sha256: str,
+        *,
+        metrics: tuple[int, Bundle, float] | None = None,
+    ) -> None:
         progress.stage, progress.total_bytes = "uploading", progress.received_bytes
+        started = time.monotonic()
+        status = None
         try:
             status = await self._scheduler.upload(task, path, sha256)
         except httpx.HTTPError as error:
             raise Wait(30, f"上传时调度中心连不上：{error}") from error
+        finally:
+            if metrics is not None:
+                original_size, bundle, prepare_seconds = metrics
+                log.info(
+                    "预抽取 %s mp4_kib=%.1f tar_kib=%.1f ratio=%.2f "
+                    "extract_s=%.3f prepare_s=%.3f upload_s=%.3f upload_status=%s",
+                    task.task_id, original_size / 1024, bundle.size / 1024,
+                    original_size / bundle.size, bundle.extract_seconds, prepare_seconds,
+                    time.monotonic() - started,
+                    status if status is not None else "interrupted",
+                )  # fmt: skip
         if status == 422:
             raise Retry("上传后调度中心核对不上大小或 SHA-256")
         if status not in (204, 404, 409):  # 404、409：任务取消或已有新轮次，文件不要了

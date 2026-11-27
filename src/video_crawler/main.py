@@ -19,6 +19,7 @@ from video_crawler.browser import Browsers
 from video_crawler.crawl import Crawler
 from video_crawler.download import Downloader
 from video_crawler.identities import IdentityPool
+from video_crawler.preextract import Preextractor
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import Scheduler
 from video_crawler.settings import Settings
@@ -79,6 +80,7 @@ async def publish_event(broker: RedisBroker, item: dict) -> None:
 
 
 async def _serve(settings: Settings, redis: Redis) -> None:
+    preextractor = Preextractor(settings) if settings.preextract_media else None
     store = IdentityStore(redis, settings.instance_id, keep_profile_dirs=settings.preserve_profiles)
     scheduler = Scheduler(settings)
     browsers = Browsers(
@@ -111,6 +113,7 @@ async def _serve(settings: Settings, redis: Redis) -> None:
         slow_window=settings.download_slow_window,
         range_parts=settings.download_range_parts,
         range_min_bytes=settings.download_range_min_bytes,
+        preextractor=preextractor,
     )
     broker = RedisBroker(client=redis)
     broker.declare_queue(EVENTS)

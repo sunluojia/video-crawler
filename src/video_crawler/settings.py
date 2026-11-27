@@ -60,6 +60,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CRAWLER_MAX_VIDEO_HEIGHT", "max_video_height"),
     )
     """优先下载的最高分辨率，横屏和竖屏均按短边计算。"""
+    preextract_media: bool = False
+    preextract_frame_count: int = Field(default=6, ge=1, le=1000)
+    preextract_audio_segment_seconds: int = Field(default=60, gt=0)
+    preextract_concurrency: int = Field(default=4, gt=0)
+    ffmpeg_path: str = "ffmpeg"
+    ffprobe_path: str = "ffprobe"
     chrome_channel: str = "chrome"
     block_nonessential_resources: bool = True
     blocked_resource_types: tuple[BlockableResource, ...] = BLOCKED_RESOURCE_TYPES

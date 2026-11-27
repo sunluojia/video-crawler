@@ -30,6 +30,7 @@ log = logging.getLogger("video_crawler")
 
 EVENTS, EVENT_ACTOR = "crawler.events", "crawler_event"
 VERSION = version("video-crawler")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 async def heartbeat(
@@ -71,7 +72,22 @@ async def heartbeat(
 
 
 async def serve(settings: Settings) -> None:
-    with Redis.from_url(settings.redis_url, socket_connect_timeout=3, socket_timeout=3) as redis:
+    with contextlib.ExitStack() as resources:
+        if settings.preextract_media:
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                settings.data_dir / "preextract.log", maxBytes=5 * 1024 * 1024, backupCount=2,
+                encoding="utf-8",
+            )  # fmt: skip
+            handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            resources.callback(handler.close)
+            resources.callback(upload_metrics.setLevel, upload_metrics.level)
+            upload_metrics.setLevel(logging.INFO)
+            upload_metrics.addHandler(handler)
+            resources.callback(upload_metrics.removeHandler, handler)
+        redis = resources.enter_context(
+            Redis.from_url(settings.redis_url, socket_connect_timeout=3, socket_timeout=3)
+        )
         await _serve(settings, redis)
 
 
@@ -198,16 +214,6 @@ def ignore_resets(loop: asyncio.AbstractEventLoop, context: dict) -> None:
 
 
 def main() -> None:
-    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    logging.basicConfig(level="INFO", format=log_format)
+    logging.basicConfig(level="INFO", format=LOG_FORMAT)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # 每个请求一行太多
-    settings = Settings()
-    if settings.preextract_media:
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            settings.data_dir / "preextract.log", maxBytes=5 * 1024 * 1024, backupCount=2,
-            encoding="utf-8",
-        )  # fmt: skip
-        handler.setFormatter(logging.Formatter(log_format))
-        upload_metrics.addHandler(handler)
-    asyncio.run(serve(settings))
+    asyncio.run(serve(Settings()))

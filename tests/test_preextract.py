@@ -1,14 +1,16 @@
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import sys
 import tarfile
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 
-from video_crawler import preextract
+from video_crawler import main, preextract
 from video_crawler.preextract import Preextractor
 from video_crawler.settings import Settings
 
@@ -171,3 +173,23 @@ async def test_static_ffmpeg_produces_playable_bundle(tmp_path, track):
                 stream["channels"],
                 stream["bit_rate"],
             ) == ("mp3", "16000", 1, "48000")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_serve_writes_preextract_metrics_without_the_cli(tmp_path, monkeypatch, enabled):
+    monkeypatch.setattr(main.Redis, "from_url", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(logging.getLogger(), "level", logging.WARNING)
+    logger = preextract.upload_metrics
+    before = logger.handlers.copy(), logger.level
+
+    async def emit(_settings, _redis):
+        logger.info("pre-extract upload finished")
+
+    monkeypatch.setattr(main, "_serve", emit)
+    await main.serve(settings(data_dir=tmp_path, preextract_media=enabled))
+    assert (logger.handlers, logger.level) == before
+    log_path = tmp_path / "preextract.log"
+    if enabled:
+        assert "pre-extract upload finished" in log_path.read_text(encoding="utf-8")
+    else:
+        assert not log_path.exists()

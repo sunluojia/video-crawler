@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Collection, Sequence
 from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 from uuid import uuid4
 
 import httpx
@@ -153,23 +153,24 @@ class Scheduler:
     async def upload(self, task: ClaimedTask, path: Path, sha256: str) -> int:
         """上传一条视频，返回状态码：204 已登记，404、409 不要了，422 内容对不上。"""
 
-        async def chunks() -> AsyncIterator[bytes]:
-            with path.open("rb") as file:
-                while chunk := file.read(1 << 20):
-                    yield chunk
+        async def chunks(file: BinaryIO) -> AsyncIterator[bytes]:
+            while chunk := file.read(1 << 20):
+                yield chunk
 
-        response = await self._http.put(
-            f"/api/download-tasks/{task.task_id}/runs/{task.run}/video",
-            content=chunks(),
-            headers={
-                "Content-Length": str(path.stat().st_size),
-                "X-Content-SHA256": sha256,
-                "X-Attempt-ID": task.attempt_id,
-                "X-Executor-ID": self.instance,
-                "X-Executor-Session-ID": str(self.session_id),
-            },
-            timeout=600,
-        )
+        # 请求提前结束时，先关闭文件，Windows 上才能立即删除临时视频。
+        with path.open("rb") as file:
+            response = await self._http.put(
+                f"/api/download-tasks/{task.task_id}/runs/{task.run}/video",
+                content=chunks(file),
+                headers={
+                    "Content-Length": str(path.stat().st_size),
+                    "X-Content-SHA256": sha256,
+                    "X-Attempt-ID": task.attempt_id,
+                    "X-Executor-ID": self.instance,
+                    "X-Executor-Session-ID": str(self.session_id),
+                },
+                timeout=600,
+            )
         return response.status_code
 
     async def register(

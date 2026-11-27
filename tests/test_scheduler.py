@@ -1,14 +1,61 @@
+import asyncio
 import hashlib
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import httpx
+import pytest
 
 from video_crawler.errors import Wait
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Scheduler
 from video_crawler.settings import Settings
 from video_crawler.store import IdentityStore
+
+
+@pytest.mark.parametrize("failure", [None, httpx.WriteError, asyncio.CancelledError])
+async def test_upload_closes_file_when_transport_stops_reading(tmp_path, monkeypatch, failure):
+    path = tmp_path / "video.mp4"
+    first_chunk = b"x" * (1 << 20)
+    path.write_bytes(first_chunk + b"tail")
+    opened = []
+    original_open = Path.open
+
+    def track_open(file_path, mode="r", *args, **kwargs):
+        file = original_open(file_path, mode, *args, **kwargs)
+        if file_path == path and mode == "rb":
+            opened.append(file)
+        return file
+
+    monkeypatch.setattr(Path, "open", track_open)
+
+    class PartialUpload(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            # The transport can retain the request body without consuming the remaining chunks.
+            self.body = aiter(request.stream)
+            assert await anext(self.body) == first_chunk
+            if failure is not None:
+                raise failure("upload interrupted")
+            return httpx.Response(409)
+
+    settings = Settings(instance_id="crawler-test", service_token="t" * 16)
+    scheduler = Scheduler(settings)
+    await scheduler._http.aclose()
+    task = ClaimedTask(str(uuid4()), 1, "download_video", str(uuid4()), {})
+    digest = hashlib.sha256(first_chunk + b"tail").hexdigest()
+    async with httpx.AsyncClient(
+        base_url=settings.scheduler_url, transport=PartialUpload()
+    ) as client:
+        scheduler._http = client
+        if failure is None:
+            assert await scheduler.upload(task, path, digest) == 409
+        else:
+            with pytest.raises(failure):
+                await scheduler.upload(task, path, digest)
+        assert len(opened) == 1
+        assert opened[0].closed
+        path.unlink()
 
 
 async def test_scheduler_claim_defer_leases_heartbeat_and_upload_share_executor_identity(tmp_path):

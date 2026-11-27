@@ -18,6 +18,7 @@ from time import monotonic
 from video_crawler.settings import Settings
 
 log = logging.getLogger(__name__)
+upload_metrics = logging.getLogger(f"{__name__}.upload")
 _AUDIO_MAPPING = re.compile(r"^\s*Stream #0:(\d+) -> #0:0\b", re.MULTILINE)
 _SAMPLE_COUNT = re.compile(r"\bn_samples: (\d+)\b")
 _PEAK_VOLUME = re.compile(r"\bmax_volume: (-?\d+(?:\.\d+)?) dB")

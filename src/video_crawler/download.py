@@ -28,7 +28,7 @@ from video_crawler.browser import Browsers, Session, page_data, session_of
 from video_crawler.crawl import retry_after_seconds
 from video_crawler.errors import Gone, Retry, Wait
 from video_crawler.identities import DownloadCredentials, Identity, IdentityPool
-from video_crawler.preextract import Bundle, Preextractor
+from video_crawler.preextract import Bundle, Preextractor, upload_metrics
 from video_crawler.routes import proxy_reachable, proxy_url
 from video_crawler.scheduler import CRAWL, DOWNLOAD, ClaimedTask, Lease, Scheduler
 from video_crawler.settings import (
@@ -269,7 +269,7 @@ class Downloader:
         finally:
             if metrics is not None:
                 original_size, bundle, prepare_seconds = metrics
-                log.info(
+                upload_metrics.info(
                     "预抽取 %s mp4_kib=%.1f tar_kib=%.1f ratio=%.2f "
                     "extract_s=%.3f prepare_s=%.3f upload_s=%.3f upload_status=%s",
                     task.task_id, original_size / 1024, bundle.size / 1024,

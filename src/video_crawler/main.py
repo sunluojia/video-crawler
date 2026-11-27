@@ -5,6 +5,7 @@ import contextlib
 import logging
 from functools import partial
 from importlib.metadata import version
+from logging.handlers import RotatingFileHandler
 
 import httpx
 import uvicorn
@@ -19,7 +20,7 @@ from video_crawler.browser import Browsers
 from video_crawler.crawl import Crawler
 from video_crawler.download import Downloader
 from video_crawler.identities import IdentityPool
-from video_crawler.preextract import Preextractor
+from video_crawler.preextract import Preextractor, upload_metrics
 from video_crawler.runner import CRAWL_CREATOR, DOWNLOAD_VIDEO, Runner
 from video_crawler.scheduler import Scheduler
 from video_crawler.settings import Settings
@@ -197,6 +198,16 @@ def ignore_resets(loop: asyncio.AbstractEventLoop, context: dict) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level="INFO", format=log_format)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # 每个请求一行太多
-    asyncio.run(serve(Settings()))
+    settings = Settings()
+    if settings.preextract_media:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            settings.data_dir / "preextract.log", maxBytes=5 * 1024 * 1024, backupCount=2,
+            encoding="utf-8",
+        )  # fmt: skip
+        handler.setFormatter(logging.Formatter(log_format))
+        upload_metrics.addHandler(handler)
+    asyncio.run(serve(settings))
